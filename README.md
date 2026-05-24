@@ -1,0 +1,2 @@
+# L-ncheck
+Løn checker
