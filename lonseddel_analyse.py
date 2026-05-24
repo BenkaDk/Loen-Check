@@ -7,7 +7,6 @@ from typing import Dict, List, Optional
 
 import pdfplumber
 
-
 PATTERNS = {
     "arbejdstimer": [
         r"Norm\.timer[\s:]*([\d]{1,4}[,.]\d{1,2})",
@@ -39,16 +38,26 @@ PATTERNS = {
         r"Udbetalt[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
         r"Netto[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
     ],
+    "sh_period": [
+        r"Søgnehelligdag,\s*opsparet\s+[\d\s\.,]+\s+[\d\s\.,]+\s+([\d\s\.,-]+)",
+        r"Søgnehelligdag\s+[\d\s\.,]+\s+[\d\s\.,]+\s+([\d\s\.,-]+)",
+        r"Søgnehelligdagsopsparing.*?([\d\s\.,-]+)",
+        r"Søgnehelligdagsbetaling.*?([\d\s\.,-]+)",
+        r"SH\s*[:\-]?\s*([\d\s\.,-]+)",
+        r"S/H\s*[:\-]?\s*([\d\s\.,-]+)",
+    ],
     "pension_employee": [
         r"Medarbejderbidrag[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+        r"Arbejdsmarkedspension, medarbejder(?:procent|bidrag).*?([\-\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
         r"Arbejdstagerpension[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
         r"Pension egen[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
     ],
     "pension_employer": [
-        r"Virksomhedsprocent.*?([\\d]{1,3}(?:[.\\s]\\d{3})*(?:[,.]\\d{2})?)",
+        r"Virksomhedsprocent\s*\([^)]*\)\s*([\-\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+        r"Arbejdsmarkedspension, virksomhedsbidrag[\s:]*([\-\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
         r"Arbejdsgiverpension[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
         r"Pension arbejdsgiver[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
-        r"Pension overføres.*?([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+        r"Pension overføres(?: til [^\d\n]*)?([\-\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)(?:\s|$)",
     ],
 }
 
@@ -76,17 +85,6 @@ def extract_first(patterns: List[str], text: str) -> Optional[float]:
     return None
 
 
-def extract_ferie_days(text: str) -> Optional[float]:
-    m = re.search(
-        r"FERIEDAGE.*?I alt\s+([\d]{1,3}[,.]\d{1,2})\s+([\d]{1,3}[,.]\d{1,2})\s+([\d]{1,3}[,.]\d{1,2})",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if m:
-        return norm_number(m.group(2))
-    return None
-
-
 def read_pdf_text(pdf_path: Path) -> str:
     parts = []
     with pdfplumber.open(str(pdf_path)) as pdf:
@@ -98,12 +96,14 @@ def read_pdf_text(pdf_path: Path) -> str:
 
 
 def parse_payslip_text(text: str) -> dict:
+    sh_period = extract_first(PATTERNS["sh_period"], text)
     return {
         "arbejdstimer": extract_first(PATTERNS["arbejdstimer"], text),
         "sygdom_days": extract_first(PATTERNS["sygdom_days"], text),
-        "ferie_days": extract_ferie_days(text),
+        "ferie_days": extract_first(PATTERNS["ferie_days"], text),
         "brutto": extract_first(PATTERNS["brutto"], text),
         "netto": extract_first(PATTERNS["netto"], text),
+        "sh_period": sh_period,
         "pension_employee": extract_first(PATTERNS["pension_employee"], text),
         "pension_employer": extract_first(PATTERNS["pension_employer"], text),
     }
@@ -138,15 +138,15 @@ def print_table(rows: List[Dict[str, object]]) -> None:
     if not rows:
         print("Ingen lønsedler fundet.")
         return
-    headers = ["Fil", "Arbejdstimer", "Sygdom (dage)", "Ferie (dage)", "Brutto", "Netto"]
+    headers = ["Fil", "Arbejdstimer", "Sygdom (dage)", "Ferie (dage)", "Brutto", "Netto", "SH-perioden", "Pension m.", "Pension arb."]
     print("\n" + " | ".join(headers))
-    print("-" * 105)
+    print("-" * 145)
     for r in rows:
-        print(f"{r['file']} | {r['arbejdstimer']} | {r['sygdom_days']} | {r['ferie_days']} | {r['brutto']} | {r['netto']}")
+        print(f"{r['file']} | {r['arbejdstimer']} | {r['sygdom_days']} | {r['ferie_days']} | {r['brutto']} | {r['netto']} | {r.get('sh_period')} | {r['pension_employee']} | {r['pension_employer']}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Læs DataLøn/payslip PDF-filer og udtræk timer/løn til CSV")
+    parser = argparse.ArgumentParser(description="Læs lønsedler og udtræk info til CSV")
     parser.add_argument("--mappe", required=True, help="Mappe med PDF-lønsedler")
     parser.add_argument("--csv", help="Gem resultat til CSV-fil")
     parser.add_argument("--debug", action="store_true", help="Vis rå tekst fra PDF for fejlsøgning")
@@ -173,6 +173,7 @@ def main():
                 "ferie_days": None,
                 "brutto": None,
                 "netto": None,
+                "sh_period": None,
                 "pension_employee": None,
                 "pension_employer": None,
             })

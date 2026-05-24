@@ -5,7 +5,7 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -14,16 +14,16 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_CENTER
 
-
 PRIMARY_DARK = colors.HexColor("#1a1a2e")
 PRIMARY_MID = colors.HexColor("#16213e")
 ACCENT = colors.HexColor("#0f3460")
 RED = colors.HexColor("#e94560")
 GREEN = colors.HexColor("#25a244")
 LIGHT_BG = colors.HexColor("#f4f6f9")
-MID_GRAY = colors.HexColor("#8892a4")
+MID_GRAY = colors.HexColor("#6f7b91")
 WHITE = colors.white
 TEXT = colors.HexColor("#1c1c2e")
+YELLOW = colors.HexColor("#f4b400")
 
 
 def normalize_decimal(value) -> Optional[float]:
@@ -79,7 +79,7 @@ def detect_category(row) -> str:
     return "work"
 
 
-def load_minuba_csv(path: Path):
+def load_minuba_csv(path: Path) -> Dict[str, float]:
     total = {"work_hours": 0.0, "sick_hours": 0.0, "vacation_hours": 0.0}
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
@@ -95,13 +95,17 @@ def load_minuba_csv(path: Path):
     return total
 
 
-def load_payslip_csv(path: Path):
+def load_payslip_csv(path: Path) -> Dict[str, Any]:
     result = {
         "work_hours": 0.0,
         "sick_hours": 0.0,
         "gross_salary": 0.0,
         "net_salary": 0.0,
-        "sh_amount": 0.0,
+        "sh_period": 0.0,
+        "sh_rest": 0.0,
+        "pension_employee": 0.0,
+        "pension_employer": 0.0,
+        "pension_total": 0.0,
         "other_deductions": 0.0,
         "rows": [],
     }
@@ -117,40 +121,53 @@ def load_payslip_csv(path: Path):
                 result["sick_hours"] += sick_hours_from_days(sick_days, sick_date)
             gross = normalize_decimal(row.get("brutto") or row.get("gross") or 0) or 0.0
             net = normalize_decimal(row.get("netto") or row.get("net") or 0) or 0.0
-            sh = normalize_decimal(row.get("sh") or row.get("sh_amount") or row.get("savings") or row.get("opsparing") or 0) or 0.0
+            sh = normalize_decimal(row.get("sh_period") or row.get("sh") or row.get("sh_amount") or row.get("savings") or row.get("opsparing") or 0) or 0.0
+            sh_rest = normalize_decimal(row.get("sh_rest") or row.get("sh_balance") or row.get("rest") or 0) or 0.0
+            emp = normalize_decimal(row.get("pension_employee") or row.get("medarbejderpension") or 0) or 0.0
+            er = normalize_decimal(row.get("pension_employer") or row.get("arbejdsgiverpension") or 0) or 0.0
+            ptotal = normalize_decimal(row.get("pension_total") or 0) or 0.0
+            if ptotal == 0.0:
+                ptotal = emp + er
             other = normalize_decimal(row.get("andre_fradrag") or row.get("other_deductions") or 0) or 0.0
             result["gross_salary"] += gross
             result["net_salary"] += net
-            result["sh_amount"] += sh
+            result["sh_period"] += sh
+            result["sh_rest"] += sh_rest
+            result["pension_employee"] += emp
+            result["pension_employer"] += er
+            result["pension_total"] += ptotal
             result["other_deductions"] += other
     return result
 
 
-def reconcile(minuba, payslip, hourly_rate):
+def money(x: float) -> str:
+    return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def reconcile(minuba: Dict[str, float], payslip: Dict[str, Any], hourly_rate: float) -> Dict[str, Any]:
     minuba_total = round(minuba["work_hours"] + minuba["sick_hours"], 2)
     payslip_total = round(payslip["work_hours"] + payslip["sick_hours"], 2)
     hour_diff = round(minuba_total - payslip_total, 2)
     money_diff = round(hour_diff * hourly_rate, 2)
-    expected_gross = round(payslip_total * hourly_rate, 2)
-    gross_diff = round(payslip["gross_salary"] - expected_gross, 2)
+
+    expected_gross_minuba = round(minuba_total * hourly_rate, 2)
+    expected_gross_payslip = round(payslip_total * hourly_rate, 2)
+    gross_diff = round(payslip["gross_salary"] - expected_gross_minuba, 2)
 
     if hour_diff > 0:
         status = "De skylder dig"
-        title = f"De skylder dig: {abs(money_diff):,.2f} kr.".replace(",", "X").replace(".", ",").replace("X", ".")
         conclusion = (
             f"Minuba viser {minuba_total:.2f} betalte timer i alt, mens lønsedlen viser {payslip_total:.2f}. "
-            f"Der mangler derfor {hour_diff:.2f} timer, svarende til {money_diff:.2f} kr. før skat og fradrag."
+            f"Der mangler derfor {hour_diff:.2f} timer, svarende til {money(money_diff)} kr. før skat og fradrag."
         )
     elif hour_diff < 0:
         status = "Du skylder dem"
-        title = f"Du skylder dem: {abs(money_diff):,.2f} kr.".replace(",", "X").replace(".", ",").replace("X", ".")
         conclusion = (
             f"Lønsedlen viser {payslip_total:.2f} betalte timer i alt, mens Minuba viser {minuba_total:.2f}. "
-            f"Der er derfor {abs(hour_diff):.2f} timer for meget, svarende til {abs(money_diff):.2f} kr. før skat og fradrag."
+            f"Der er derfor {abs(hour_diff):.2f} timer for meget, svarende til {money(abs(money_diff))} kr. før skat og fradrag."
         )
     else:
         status = "Timerne matcher"
-        title = "Timerne matcher"
         conclusion = f"Minuba og lønsedlens betalte timer matcher præcist: {minuba_total:.2f} timer."
 
     summary = (
@@ -159,47 +176,52 @@ def reconcile(minuba, payslip, hourly_rate):
         f"Ferie-timer er ikke medregnet. "
         f"Lønsedlens arbejdstimer: {payslip['work_hours']:.2f}. "
         f"Lønsedlens sygetimer beregnet fra dage: {payslip['sick_hours']:.2f}. "
-        f"Bruttoløn afviger med {gross_diff:.2f} kr. i forhold til timeløn-beregning."
+        f"SH i perioden: {payslip['sh_period']:.2f}. "
+        f"SH rest: {payslip['sh_rest']:.2f}. "
+        f"Medarbejderpension: {payslip['pension_employee']:.2f}. "
+        f"Arbejdsgiverpension: {payslip['pension_employer']:.2f}. "
+        f"Pension i alt: {payslip['pension_total']:.2f}."
     )
 
     return {
         "status": status,
-        "title": title,
         "minuba_work_hours": round(minuba["work_hours"], 2),
         "minuba_sick_hours": round(minuba["sick_hours"], 2),
+        "minuba_vacation_hours": round(minuba["vacation_hours"], 2),
         "minuba_total_hours": minuba_total,
         "payslip_work_hours": round(payslip["work_hours"], 2),
         "payslip_sick_hours": round(payslip["sick_hours"], 2),
         "payslip_total_hours": payslip_total,
         "hour_diff": hour_diff,
         "money_diff": money_diff,
-        "expected_gross": expected_gross,
+        "expected_gross_minuba": expected_gross_minuba,
+        "expected_gross_payslip": expected_gross_payslip,
         "gross_salary": round(payslip["gross_salary"], 2),
         "gross_diff": gross_diff,
         "net_salary": round(payslip["net_salary"], 2),
-        "sh_amount": round(payslip["sh_amount"], 2),
+        "sh_period": round(payslip["sh_period"], 2),
+        "sh_rest": round(payslip["sh_rest"], 2),
+        "pension_employee": round(payslip["pension_employee"], 2),
+        "pension_employer": round(payslip["pension_employer"], 2),
+        "pension_total": round(payslip["pension_total"], 2),
         "other_deductions": round(payslip["other_deductions"], 2),
         "summary": summary,
         "conclusion": conclusion,
     }
 
 
-def money(x):
-    return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-
-def write_csv(data, path: Path):
+def write_csv(data: Dict[str, Any], path: Path):
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(data.keys()))
         writer.writeheader()
         writer.writerow(data)
 
 
-def write_json(data, path: Path):
+def write_json(data: Dict[str, Any], path: Path):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def make_pdf(data, path: Path, hourly_rate: float):
+def make_pdf(data: Dict[str, Any], path: Path, hourly_rate: float):
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle("titlex", fontName="Helvetica-Bold", fontSize=22, textColor=WHITE, alignment=TA_LEFT, leading=24))
     styles.add(ParagraphStyle("subx", fontName="Helvetica", fontSize=10, textColor=colors.HexColor("#aab4c8"), alignment=TA_LEFT, leading=12))
@@ -230,7 +252,7 @@ def make_pdf(data, path: Path, hourly_rate: float):
     verdict_color = RED if data["hour_diff"] < 0 else GREEN if data["hour_diff"] > 0 else ACCENT
     verdict_amount = f"{money(abs(data['money_diff']))} kr." if data["hour_diff"] != 0 else "0,00 kr."
     verdict = Table([
-        [Paragraph(data["title"], styles["verdicts"])],
+        [Paragraph(data["status"], styles["verdicts"])],
         [Paragraph(verdict_amount, styles["verdictx"])],
         [Paragraph("Difference baseret på timer og timeløn", styles["verdicts"])],
     ], colWidths=[183 * mm])
@@ -252,7 +274,7 @@ def make_pdf(data, path: Path, hourly_rate: float):
     stats = [
         [stat_cell("MINUBA ARBEJDSTIMER", money(data["minuba_work_hours"])), stat_cell("LØNSEDDEL ARBEJDSTIMER", money(data["payslip_work_hours"]))],
         [stat_cell("MINUBA SYGETIMER", money(data["minuba_sick_hours"])), stat_cell("LØNSEDDEL SYGETIMER", money(data["payslip_sick_hours"]))],
-        [stat_cell("MINUBA TOTAL BETALTE TIMER", money(data["minuba_total_hours"])), stat_cell("LØNSEDDEL TOTAL BETALTE TIMER", money(data["payslip_total_hours"]))],
+        [stat_cell("MINUBA FERIE-TIMER", money(data["minuba_vacation_hours"])), stat_cell("LØNSEDDEL TOTAL BETALTE TIMER", money(data["payslip_total_hours"]))],
         [stat_cell("FORSKEL I TIMER", money(data["hour_diff"]), True), stat_cell("FORSKEL I KRONER", f"{money(data['money_diff'])} kr.", True)],
     ]
     stat_tables = []
@@ -286,10 +308,15 @@ def make_pdf(data, path: Path, hourly_rate: float):
     lon_data = [
         [Paragraph("POST", ParagraphStyle("p1", fontName="Helvetica-Bold", fontSize=9.5, textColor=WHITE)), Paragraph("BELØB", ParagraphStyle("p1", fontName="Helvetica-Bold", fontSize=9.5, textColor=WHITE))],
         ["Timeløn", f"{money(hourly_rate)} kr."],
-        ["Forventet bruttoløn", f"{money(data['expected_gross'])} kr."],
-        ["Faktisk bruttoløn", f"{money(data['gross_salary'])} kr."],
-        ["Afvigelse bruttoløn", f"{money(data['gross_diff'])} kr."],
-        ["SH / Opsparing", f"{money(data['sh_amount'])} kr."],
+        ["Forventet bruttoløn ud fra Minuba", f"{money(data['expected_gross_minuba'])} kr."],
+        ["Forventet bruttoløn ud fra lønseddel", f"{money(data['expected_gross_payslip'])} kr."],
+        ["Lønseddel brutto", f"{money(data['gross_salary'])} kr."],
+        ["Lønseddel netto", f"{money(data['net_salary'])} kr."],
+        ["SH / Opsparing i perioden", f"{money(data['sh_period'])} kr."],
+        ["SH rest", f"{money(data['sh_rest'])} kr."],
+        ["Medarbejderpension", f"{money(data['pension_employee'])} kr."],
+        ["Arbejdsgiverpension", f"{money(data['pension_employer'])} kr."],
+        ["Pension i alt", f"{money(data['pension_total'])} kr."],
         ["Andre fradrag", f"{money(data['other_deductions'])} kr."],
     ]
     lon_tbl = Table(lon_data, colWidths=[110 * mm, 73 * mm])
@@ -305,8 +332,10 @@ def make_pdf(data, path: Path, hourly_rate: float):
         ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5 * mm),
         ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
         ("TEXTCOLOR", (0, 1), (-1, -1), TEXT),
-        ("FONTNAME", (1, 5), (1, 5), "Helvetica-Bold"),
-        ("TEXTCOLOR", (1, 5), (1, 5), RED),
+        ("FONTNAME", (1, 4), (1, 4), "Helvetica-Bold"),
+        ("TEXTCOLOR", (1, 4), (1, 4), YELLOW),
+        ("TEXTCOLOR", (1, 5), (1, 5), YELLOW),
+        ("TEXTCOLOR", (1, 6), (1, 6), YELLOW),
     ]))
     story.append(lon_tbl)
     story.append(Spacer(1, 5 * mm))
@@ -317,7 +346,9 @@ def make_pdf(data, path: Path, hourly_rate: float):
         ("Medregnet:", "Arbejdstimer og sygetimer fra Minuba."),
         ("Ikke medregnet:", "Ferietimer, da ferie er selvbetalt."),
         ("Sygedage omregnet:", "Fredage tæller 7,0 timer. Øvrige dage tæller 7,5 timer."),
-        ("Regel:", "Lønseddel total > Minuba total = du skylder. Minuba total > lønseddel total = de skylder dig."),
+        ("Hovedregel:", "Lønseddel total > Minuba total = du skylder. Minuba total > lønseddel total = de skylder dig."),
+        ("SH / Opsparing:", "Vises som info i rapporten."),
+        ("SH rest:", "Viser restsaldo, hvis den findes i DataLøn.")
     ]
     rule_rows = [[Paragraph(k, ParagraphStyle("rk", fontName="Helvetica-Bold", fontSize=9, textColor=ACCENT)), Paragraph(v, styles["bodyx"])] for k, v in rules]
     rule_tbl = Table(rule_rows, colWidths=[38 * mm, 145 * mm])
