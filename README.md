@@ -2,6 +2,11 @@
 
 Et Python-værktøj til at sammenligne registrerede timer fra Minuba med data fra lønsedler, så du kan tjekke om din løn passer.
 
+## Repo
+
+Projektet ligger her:
+[https://github.com/BenkaDk/Loen-Check](https://github.com/BenkaDk/Loen-Check)
+
 ## Formål
 
 Projektet bruges til at:
@@ -18,8 +23,13 @@ Projektet bruges til at:
 - Læser lønsedler automatisk
 - Matcher data pr. måned
 - Beregner forventet løn ud fra timeløn
-- Marker fejl og afvigelser
+- Markerer fejl og afvigelser
 - Eksporterer resultater til CSV og JSON
+
+## Privat Minuba-script
+
+Minuba-delen er lavet i et privat repo og er derfor ikke offentliggjort her.  
+Dette repo indeholder løncheck-delen og sammenligningen mellem Minuba-data og lønsedler.
 
 ## Projektstruktur
 
@@ -30,6 +40,7 @@ loncheck/
 ├── reconcile.py
 ├── requirements.txt
 ├── .gitignore
+├── LICENSE
 ├── data/
 │   ├── minuba_2025.csv
 │   └── payslips_2025.csv
@@ -43,8 +54,8 @@ loncheck/
 ### 1. Klon repoet
 
 ```bash
-git clone https://github.com/BenkaDk/L-ncheck.git
-cd L-ncheck
+git clone https://github.com/BenkaDk/Loen-Check.git
+cd Loen-Check
 ```
 
 ### 2. Opret virtuelt miljø
@@ -139,3 +150,7 @@ period,paid_hours,gross_salary,net_salary,pension_employee,pension_employer,vaca
 - [ ] bedre matching af lønseddel-felter
 - [ ] kontrakt-upload til timeløn og pension
 - [ ] PyInstaller build til .exe
+
+## License
+
+This project is licensed under the MIT License.
