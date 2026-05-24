@@ -1,249 +1,190 @@
 #!/usr/bin/env python3
-"""
-lonseddel_analyse.py
---------------------
-Læser PDF-lønsedler fra en mappe og udregner:
-  - Samlede arbejdstimer
-  - Samlede sygedage
-  - Samlede feriedage
-
-Krav:
-    pip install pdfplumber rich
-
-Brug:
-    python lonseddel_analyse.py --mappe ./lønsedler
-    python lonseddel_analyse.py --mappe ./lønsedler --debug
-"""
-
 import argparse
+import csv
 import re
-import sys
 from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, List, Optional
 
-try:
-    import pdfplumber
-except ImportError:
-    sys.exit("Mangler pdfplumber. Installer med: pip install pdfplumber")
-
-try:
-    from rich.console import Console
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich import box
-    HAS_RICH = True
-except ImportError:
-    HAS_RICH = False
-
-console = Console() if HAS_RICH else None
+import pdfplumber
 
 
-# ---------------------------------------------------------------------------
-# Dataklasse for én lønseddel
-# ---------------------------------------------------------------------------
-@dataclass
-class Lonseddel:
-    fil: str
-    arbejdstimer: float = 0.0
-    sygedage: float = 0.0
-    feriedage: float = 0.0
-    fejl: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
-# Mønstre til udtræk – tilpas til dit lønsystem
-# ---------------------------------------------------------------------------
 PATTERNS = {
-    # Timer: fx "Arbejdstimer    160,00" eller "Timer i alt: 37,50"
     "arbejdstimer": [
-        r"(?:arbejdstimer?|timer\s+i\s+alt|normaltimer|løntimer)[\s:]*([\d]{1,4}[,.]\d{1,2})",
-        r"(?:betalte\s+timer|antal\s+timer)[\s:]*([\d]{1,4}[,.]\d{1,2})",
-        r"timer[\s:]+([\d]{1,4}[,.]\d{1,2})",
+        r"Norm\.timer[\s:]*([\d]{1,4}[,.]\d{1,2})",
+        r"Betalte timer[\s:]*([\d]{1,4}[,.]\d{1,2})",
+        r"Arbejdstid[\s:]*([\d]{1,4}[,.]\d{1,2})",
+        r"Arbejdstimer[\s:]*([\d]{1,4}[,.]\d{1,2})",
+        r"Timer[\s:]*([\d]{1,4}[,.]\d{1,2})",
     ],
-    # Sygefravær: fx "Sygedage  2" eller "Sygdom: 1,0"
-    "sygedage": [
-        r"(?:sygedage|sygefrav[æa]r|sygdom)[\s:]*([\d]{1,2}[,.]?\d{0,2})",
-        r"(?:fravær\s+sygdom)[\s:]*([\d]{1,2}[,.]?\d{0,2})",
+    "sygdom_days": [
+        r"Sygedage[\s:]*([\d]{1,4}[,.]\d{1,2})",
+        r"Sygdom[\s:]*([\d]{1,4}[,.]\d{1,2})",
+        r"Fravær[\s:]*([\d]{1,4}[,.]\d{1,2})",
     ],
-    # Ferie: fx "Feriedage   5" eller "Ferie afholdt: 2,0"
-    "feriedage": [
-        r"(?:feriedage|ferie\s+afholdt|afholdt\s+ferie|ferie)[\s:]*([\d]{1,2}[,.]?\d{0,2})",
-        r"(?:optjent\s+ferie|feriefridage)[\s:]*([\d]{1,2}[,.]?\d{0,2})",
+    "ferie_days": [
+        r"Feriedage[\s:]*([\d]{1,4}[,.]\d{1,2})",
+        r"Ferie[\s:]*([\d]{1,4}[,.]\d{1,2})",
+        r"Afholdt ferie[\s:]*([\d]{1,4}[,.]\d{1,2})",
+    ],
+    "brutto": [
+        r"A-Indkomst[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+        r"AM-grundlag[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+        r"Ferieberettiget løn[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+        r"Bruttoløn[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+        r"Brutto[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+        r"Løn før skat[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+    ],
+    "netto": [
+        r"Til udbetaling[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+        r"Udbetalt[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+        r"Netto[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+    ],
+    "pension_employee": [
+        r"Medarbejderbidrag[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+        r"Arbejdstagerpension[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+        r"Pension egen[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+    ],
+    "pension_employer": [
+        r"Virksomhedsprocent.*?([\\d]{1,3}(?:[.\\s]\\d{3})*(?:[,.]\\d{2})?)",
+        r"Arbejdsgiverpension[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+        r"Pension arbejdsgiver[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+        r"Pension overføres.*?([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
     ],
 }
 
 
-def dk_til_float(tekst: str) -> float:
-    """Konverterer dansk talformat (1.234,56 eller 1234,56) til float."""
-    tekst = tekst.replace(".", "").replace(",", ".")
-    try:
-        return float(tekst)
-    except ValueError:
-        return 0.0
-
-
-def udtræk_værdi(tekst: str, kategori: str, debug: bool = False) -> float:
-    """Prøver alle mønstre for kategorien og returnerer første match."""
-    for mønster in PATTERNS[kategori]:
-        match = re.search(mønster, tekst, re.IGNORECASE | re.MULTILINE)
-        if match:
-            if debug:
-                print(f"  [{kategori}] Match med: {mønster!r} → {match.group(1)!r}")
-            return dk_til_float(match.group(1))
-    return 0.0
-
-
-def læs_pdf(sti: Path, debug: bool = False) -> Lonseddel:
-    """Udtrækker tekst fra PDF og finder relevante værdier."""
-    seddel = Lonseddel(fil=sti.name)
-    try:
-        with pdfplumber.open(sti) as pdf:
-            # Saml al tekst fra alle sider
-            al_tekst = "\n".join(
-                side.extract_text() or "" for side in pdf.pages
-            )
-
-        if debug:
-            print(f"\n--- {sti.name} ---")
-            print(al_tekst[:1500])
-            print("---")
-
-        seddel.arbejdstimer = udtræk_værdi(al_tekst, "arbejdstimer", debug)
-        seddel.sygedage = udtræk_værdi(al_tekst, "sygedage", debug)
-        seddel.feriedage = udtræk_værdi(al_tekst, "feriedage", debug)
-
-    except Exception as exc:
-        seddel.fejl = str(exc)
-
-    return seddel
-
-
-def analyser_mappe(mappe: Path, debug: bool = False) -> list[Lonseddel]:
-    """Finder alle PDF-filer i mappen og analyserer dem."""
-    pdf_filer = sorted(mappe.glob("*.pdf"))
-    if not pdf_filer:
-        sys.exit(f"Ingen PDF-filer fundet i: {mappe}")
-
-    return [læs_pdf(f, debug) for f in pdf_filer]
-
-
-def udskriv_resultater(sedler: list[Lonseddel]) -> None:
-    """Printer en pæn oversigt med totaler."""
-    total_timer = sum(s.arbejdstimer for s in sedler)
-    total_sygdom = sum(s.sygedage for s in sedler)
-    total_ferie = sum(s.feriedage for s in sedler)
-    fejl_sedler = [s for s in sedler if s.fejl]
-
-    if HAS_RICH:
-        tabel = Table(
-            title="📄 Lønseddel-analyse",
-            box=box.ROUNDED,
-            show_lines=True,
-        )
-        tabel.add_column("Fil", style="cyan", no_wrap=True)
-        tabel.add_column("Arbejdstimer", justify="right", style="green")
-        tabel.add_column("Sygedage", justify="right", style="yellow")
-        tabel.add_column("Feriedage", justify="right", style="blue")
-        tabel.add_column("Status", justify="center")
-
-        for s in sedler:
-            if s.fejl:
-                tabel.add_row(s.fil, "–", "–", "–", f"[red]FEJL: {s.fejl}[/red]")
-            else:
-                tabel.add_row(
-                    s.fil,
-                    f"{s.arbejdstimer:.2f}",
-                    f"{s.sygedage:.1f}",
-                    f"{s.feriedage:.1f}",
-                    "[green]OK[/green]",
-                )
-
-        # Totallinje
-        tabel.add_row(
-            "[bold]TOTAL[/bold]",
-            f"[bold green]{total_timer:.2f}[/bold green]",
-            f"[bold yellow]{total_sygdom:.1f}[/bold yellow]",
-            f"[bold blue]{total_ferie:.1f}[/bold blue]",
-            "",
-        )
-
-        console.print()
-        console.print(tabel)
-        console.print(
-            Panel(
-                f"[green]Arbejdstimer i alt:[/green]  {total_timer:.2f} timer\n"
-                f"[yellow]Sygedage i alt:[/yellow]      {total_sygdom:.1f} dage\n"
-                f"[blue]Feriedage i alt:[/blue]     {total_ferie:.1f} dage\n"
-                f"Antal lønsedler:        {len(sedler)}",
-                title="📊 Samlet oversigt",
-                border_style="bright_white",
-            )
-        )
-
-        if fejl_sedler:
-            console.print(f"[red]⚠️  {len(fejl_sedler)} seddel(er) kunne ikke læses korrekt.[/red]")
-
+def norm_number(value: str) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip().replace("kr.", "").replace("kr", "")
+    text = text.replace(" ", "")
+    if not text:
+        return None
+    if text.count(",") == 1 and text.count(".") >= 1:
+        text = text.replace(".", "").replace(",", ".")
     else:
-        # Fallback uden Rich
-        print("\n=== Lønseddel-analyse ===")
-        print(f"{'Fil':<35} {'Timer':>10} {'Sygdage':>10} {'Feriedage':>10}")
-        print("-" * 70)
-        for s in sedler:
-            if s.fejl:
-                print(f"{s.fil:<35} FEJL: {s.fejl}")
-            else:
-                print(f"{s.fil:<35} {s.arbejdstimer:>10.2f} {s.sygedage:>10.1f} {s.feriedage:>10.1f}")
-        print("-" * 70)
-        print(f"{'TOTAL':<35} {total_timer:>10.2f} {total_sygdom:>10.1f} {total_ferie:>10.1f}")
-        print(f"\nSamlet: {total_timer:.2f} timer  |  {total_sygdom:.1f} sygedage  |  {total_ferie:.1f} feriedage")
+        text = text.replace(",", ".")
+    m = re.search(r"-?\d+(?:\.\d+)?", text)
+    return float(m.group()) if m else None
 
 
-# ---------------------------------------------------------------------------
-# Tip: Tilpas mønstre til dit lønsystem
-# ---------------------------------------------------------------------------
-TILPASNINGS_GUIDE = """
-TILPASNING AF MØNSTRE
-=====================
-Åbn filen og find ordbogen PATTERNS øverst.
-Hvert mønster er et regulært udtryk (regex) der matcher tekst på din lønseddel.
-
-Eksempel – hvis din lønseddel skriver "Norm.timer: 162,00":
-    Tilføj til arbejdstimer-listen:
-        r"Norm\.timer[\s:]*([\d]{1,4}[,.]\d{1,2})"
-
-Brug --debug flaget for at se den rå PDF-tekst og hvilke mønstre der matcher:
-    python lonseddel_analyse.py --mappe ./lønsedler --debug
-"""
+def extract_first(patterns: List[str], text: str) -> Optional[float]:
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
+        if m:
+            return norm_number(m.group(1))
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def extract_ferie_days(text: str) -> Optional[float]:
+    m = re.search(
+        r"FERIEDAGE.*?I alt\s+([\d]{1,3}[,.]\d{1,2})\s+([\d]{1,3}[,.]\d{1,2})\s+([\d]{1,3}[,.]\d{1,2})",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        return norm_number(m.group(2))
+    return None
+
+
+def read_pdf_text(pdf_path: Path) -> str:
+    parts = []
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page in pdf.pages:
+            txt = page.extract_text() or ""
+            if txt:
+                parts.append(txt)
+    return "\n".join(parts)
+
+
+def parse_payslip_text(text: str) -> dict:
+    return {
+        "arbejdstimer": extract_first(PATTERNS["arbejdstimer"], text),
+        "sygdom_days": extract_first(PATTERNS["sygdom_days"], text),
+        "ferie_days": extract_ferie_days(text),
+        "brutto": extract_first(PATTERNS["brutto"], text),
+        "netto": extract_first(PATTERNS["netto"], text),
+        "pension_employee": extract_first(PATTERNS["pension_employee"], text),
+        "pension_employer": extract_first(PATTERNS["pension_employer"], text),
+    }
+
+
+def analyze_payslip(pdf_path: Path, debug: bool = False) -> Dict[str, object]:
+    text = read_pdf_text(pdf_path)
+    if debug:
+        print(f"\n===== {pdf_path.name} =====")
+        print(text[:20000])
+        print("===== END =====\n")
+    data = parse_payslip_text(text)
+    data["file"] = pdf_path.name
+    return data
+
+
+def find_pdfs(folder: Path) -> List[Path]:
+    return sorted([p for p in folder.rglob("*.pdf") if p.is_file()])
+
+
+def write_csv(rows: List[Dict[str, object]], output_path: Path) -> None:
+    if not rows:
+        return
+    fieldnames = list(rows[0].keys())
+    with output_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def print_table(rows: List[Dict[str, object]]) -> None:
+    if not rows:
+        print("Ingen lønsedler fundet.")
+        return
+    headers = ["Fil", "Arbejdstimer", "Sygdom (dage)", "Ferie (dage)", "Brutto", "Netto"]
+    print("\n" + " | ".join(headers))
+    print("-" * 105)
+    for r in rows:
+        print(f"{r['file']} | {r['arbejdstimer']} | {r['sygdom_days']} | {r['ferie_days']} | {r['brutto']} | {r['netto']}")
+
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Analyser PDF-lønsedler og summér timer, sygedage og feriedage.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=TILPASNINGS_GUIDE,
-    )
-    parser.add_argument(
-        "--mappe", "-m",
-        default=".",
-        help="Sti til mappen med PDF-lønsedler (standard: aktuel mappe)",
-    )
-    parser.add_argument(
-        "--debug", "-d",
-        action="store_true",
-        help="Vis rå PDF-tekst og regex-matches for fejlsøgning",
-    )
+    parser = argparse.ArgumentParser(description="Læs DataLøn/payslip PDF-filer og udtræk timer/løn til CSV")
+    parser.add_argument("--mappe", required=True, help="Mappe med PDF-lønsedler")
+    parser.add_argument("--csv", help="Gem resultat til CSV-fil")
+    parser.add_argument("--debug", action="store_true", help="Vis rå tekst fra PDF for fejlsøgning")
     args = parser.parse_args()
 
-    mappe = Path(args.mappe).resolve()
-    if not mappe.is_dir():
-        sys.exit(f"Mappen findes ikke: {mappe}")
+    folder = Path(args.mappe)
+    if not folder.exists() or not folder.is_dir():
+        raise SystemExit(f"Mappe findes ikke: {folder}")
 
-    sedler = analyser_mappe(mappe, debug=args.debug)
-    udskriv_resultater(sedler)
+    pdfs = find_pdfs(folder)
+    if not pdfs:
+        raise SystemExit(f"Ingen PDF-filer fundet i: {folder}")
+
+    rows = []
+    for pdf in pdfs:
+        try:
+            row = analyze_payslip(pdf, debug=args.debug)
+            rows.append(row)
+        except Exception as e:
+            rows.append({
+                "file": pdf.name,
+                "arbejdstimer": None,
+                "sygdom_days": None,
+                "ferie_days": None,
+                "brutto": None,
+                "netto": None,
+                "pension_employee": None,
+                "pension_employer": None,
+            })
+            print(f"Fejl i {pdf.name}: {e}")
+
+    print_table(rows)
+
+    if args.csv:
+        out = Path(args.csv)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        write_csv(rows, out)
+        print(f"\nCSV gemt: {out}")
 
 
 if __name__ == "__main__":
