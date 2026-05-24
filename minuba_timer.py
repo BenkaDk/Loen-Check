@@ -1,33 +1,28 @@
 #!/usr/bin/env python3
 """
-Minuba Timer Scraper
-- Henter timer fra Minuba > Min Tid
-- Klassificerer Arbejde / Ferie / Sygdom
-- Eksporterer CSV og fuld PDF-rapport
-- Direkte startdato i datofelt med fallback-navigation
-- Egnet til GUI + PyInstaller
+Minuba Timer Scraper + PDF-rapport
+Bygget til at bevare den gamle login/scrape-adfærd og tilføje PDF-output.
+
+KRAV (Arch anbefalet):
+  sudo pacman -S chromium python-selenium python-pandas python-weasyprint
+
+Alternativ pip:
+  pip install selenium webdriver-manager pandas weasyprint openpyxl
+
+BRUG:
+  python minuba_timer.py --email dig@example.dk --adgangskode DinKode --periode 2025-04 --pdf april.pdf
+  python minuba_timer.py --email dig@example.dk --adgangskode DinKode --fra 2025-01-01 --til 2025-03-31 --pdf q1.pdf
 """
 
-import sys
-import time
-import re
-import csv
-import argparse
-import getpass
-from pathlib import Path
+import sys, time, re, argparse, getpass, json
 from datetime import date, datetime, timedelta
 from collections import defaultdict
+from pathlib import Path
 
 try:
     import pandas as pd
 except ImportError:
-    print("❌ Mangler pandas. Installer med: pip install pandas")
-    sys.exit(1)
-
-try:
-    from fpdf import FPDF
-except ImportError:
-    print("❌ Mangler fpdf2. Installer med: pip install fpdf2")
+    print("❌ pip install selenium webdriver-manager pandas weasyprint openpyxl")
     sys.exit(1)
 
 try:
@@ -40,14 +35,18 @@ try:
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.common.exceptions import TimeoutException, ElementNotInteractableException
 except ImportError:
-    print("❌ Mangler selenium. Installer med: pip install selenium webdriver-manager")
+    print("❌ pip install selenium webdriver-manager")
     sys.exit(1)
 
 try:
     from webdriver_manager.chrome import ChromeDriverManager
 except ImportError:
-    print("❌ Mangler webdriver-manager. Installer med: pip install webdriver-manager")
-    sys.exit(1)
+    ChromeDriverManager = None
+
+try:
+    from weasyprint import HTML
+except ImportError:
+    HTML = None
 
 FERIE_KEYWORDS = ["ferie", "vacation", "afspadsering", "feriefri", "holiday", "fravær"]
 SYGDOM_KEYWORDS = ["syg", "sygdom", "sick", "barn syg", "barns sygdom", "omsorgsdage"]
@@ -89,20 +88,13 @@ def parse_float(s: str) -> float:
         return 0.0
 
 
-def format_hours(hours: float) -> str:
-    return f"{float(hours or 0):.2f}"
-
-
 def parse_date_any(value: str, year_hint: int = None):
     s = str(value or "").strip()
     if not s:
         return None
-    for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y", "%d.%m.%Y", "%d-%m-%y"):
+    for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y", "%d.%m.%Y"):
         try:
-            d = datetime.strptime(s, fmt).date()
-            if d.year < 100:
-                d = d.replace(year=2000 + d.year)
-            return d
+            return datetime.strptime(s, fmt).date()
         except Exception:
             pass
     if year_hint:
@@ -151,10 +143,20 @@ def build_driver(headless=True):
         opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1440,1000")
+    opts.add_argument("--window-size=1400,900")
     opts.add_argument("--lang=da-DK")
     opts.add_experimental_option("excludeSwitches", ["enable-logging"])
-    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+
+    chromium_bin = "/usr/bin/chromium"
+    chromedriver_bin = "/usr/bin/chromedriver"
+    if Path(chromium_bin).exists() and Path(chromedriver_bin).exists():
+        opts.binary_location = chromium_bin
+        return webdriver.Chrome(service=Service(chromedriver_bin), options=opts)
+
+    if ChromeDriverManager is not None:
+        return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+
+    return webdriver.Chrome(options=opts)
 
 
 def write_debug(driver, prefix="debug"):
@@ -162,9 +164,9 @@ def write_debug(driver, prefix="debug"):
         with open(f"{prefix}.html", "w", encoding="utf-8") as f:
             f.write(driver.page_source)
         driver.save_screenshot(f"{prefix}.png")
-        print(f" ℹ️ Gemt {prefix}.html og {prefix}.png")
+        print(f"   ℹ️ Gemt {prefix}.html og {prefix}.png")
     except Exception as e:
-        print(f" ⚠️ Debug-filer fejlede: {e}")
+        print(f"   ⚠️ Debug-filer fejlede: {e}")
 
 
 def find_visible(driver, selectors):
@@ -189,8 +191,7 @@ def interact(el, val):
                 "arguments[0].value=arguments[1];"
                 "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
                 "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
-                el, val,
-            )
+                el, val)
             return True
         except Exception:
             return False
@@ -216,8 +217,14 @@ def click_by_text(driver, texts):
 def login(driver, email, adgangskode):
     print("🔐 Logger ind på Minuba...")
     wait = WebDriverWait(driver, 20)
-    email_sel = ["input[type='email']", "input[name='email']", "input[name='username']", "input[id='username']", "input[id*='email']", "input[placeholder*='mail']"]
-    pw_sel = ["input[type='password']", "input[name='password']", "input[id*='password']", "input[placeholder*='adgang']", "input[placeholder*='kode']"]
+    email_sel = [
+        "input[type='email']", "input[name='email']", "input[name='username']",
+        "input[id='username']", "input[id*='email']", "input[placeholder*='mail']"
+    ]
+    pw_sel = [
+        "input[type='password']", "input[name='password']", "input[id*='password']",
+        "input[placeholder*='adgang']", "input[placeholder*='kode']"
+    ]
     btn_sel = ["button[type='submit']", "button.login-btn", "input[type='submit']"]
 
     email_felt = None
@@ -249,7 +256,8 @@ def login(driver, email, adgangskode):
     btn = find_visible(driver, btn_sel)
     if not btn:
         try:
-            btn = driver.find_element(By.XPATH, "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'log ind') or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'login')]")
+            btn = driver.find_element(By.XPATH,
+                "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'log ind') or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'login')]")
         except Exception:
             pass
     if not btn:
@@ -260,25 +268,39 @@ def login(driver, email, adgangskode):
 
     btn.click()
     try:
-        wait.until(lambda d: "login" not in d.current_url.lower())
+        wait.until(EC.url_contains("dashboard"))
     except TimeoutException:
         time.sleep(3)
-        if "login" in driver.current_url.lower():
-            print("❌ Login mislykkedes — tjek email og adgangskode")
-            write_debug(driver, "debug_login_failed")
-            driver.quit()
-            sys.exit(1)
+    if "login" in driver.current_url.lower():
+        print("❌ Login mislykkedes — tjek email og adgangskode")
+        write_debug(driver, "debug_login_failed")
+        driver.quit()
+        sys.exit(1)
     print("✅ Logget ind!")
 
 
 def navigate_to_min_tid(driver):
     print("📋 Navigerer til Min Tid...")
+    wait = WebDriverWait(driver, 15)
     driver.get(f"{MINUBA_URL}/#/mytimeregistration")
     time.sleep(2)
     click_by_text(driver, ["Min tid", "MinTid", "Min Time", "My time"])
-    wait = WebDriverWait(driver, 20)
-    wait.until(lambda d: find_visible(d, DATE_INPUT_SELECTORS) is not None)
-    print("✅ Min Tid er åben")
+    time.sleep(2)
+    if "mytimeregistration" not in driver.current_url and "mintime" not in driver.current_url:
+        try:
+            links = driver.find_elements(By.XPATH,
+                "//*[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'min tid') or contains(@href,'mytimeregistration') or contains(@href,'mintime')]")
+            if links:
+                links[0].click()
+                time.sleep(2)
+        except Exception:
+            pass
+    try:
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR,
+            "input[class*='cal'], input[class*='hasDatepicker'], input.z-textbox.hasDatepicker, input[type='date']")))
+    except Exception:
+        pass
+    print(f"   URL: {driver.current_url}")
 
 
 def get_cal_date(driver):
@@ -295,69 +317,14 @@ def get_cal_date(driver):
     return None
 
 
-def set_start_date(driver, target_date: date) -> bool:
-    print(f"📅 Sætter startdato direkte til {target_date}...")
-    value_iso = target_date.strftime("%Y-%m-%d")
-    value_dk = target_date.strftime("%d-%m-%Y")
-    value_dk_slash = target_date.strftime("%d/%m/%Y")
-
-    for css in DATE_INPUT_SELECTORS:
-        try:
-            for el in driver.find_elements(By.CSS_SELECTOR, css):
-                if not el.is_displayed():
-                    continue
-
-                driver.execute_script(
-                    """
-                    const el = arguments[0];
-                    const values = [arguments[1], arguments[2], arguments[3]];
-                    el.removeAttribute('readonly');
-                    el.focus();
-                    for (const v of values) {
-                        try {
-                            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-                            if (setter) setter.call(el, v);
-                            else el.value = v;
-                            el.dispatchEvent(new Event('input', { bubbles: true }));
-                            el.dispatchEvent(new Event('change', { bubbles: true }));
-                            el.dispatchEvent(new Event('blur', { bubbles: true }));
-                        } catch (e) {}
-                    }
-                    """,
-                    el, value_dk, value_iso, value_dk_slash,
-                )
-
-                for candidate in [value_dk, value_iso, value_dk_slash]:
-                    try:
-                        el.send_keys(Keys.CONTROL, "a")
-                        el.send_keys(candidate)
-                        el.send_keys(Keys.TAB)
-                        time.sleep(1.0)
-                        current = (el.get_attribute("value") or "").strip()
-                        parsed = parse_date_any(current)
-                        if parsed == target_date:
-                            print(f"✅ Startdato sat via felt: {current}")
-                            return True
-                    except Exception:
-                        pass
-
-                current = (el.get_attribute("value") or "").strip()
-                parsed = parse_date_any(current)
-                if parsed == target_date:
-                    print(f"✅ Startdato sat via JS: {current}")
-                    return True
-        except Exception:
-            pass
-
-    print("⚠️ Kunne ikke sætte startdato direkte i feltet")
-    return False
-
-
 def click_next(driver) -> bool:
     selectors = [
         "div.arrowWrap[title*='Næste']", "div.arrowWrap[title*='Next']", "div.arrow-right",
-        "button[title*='Næste']", "button[aria-label*='Næste']", "button[title*='Next']",
-        "button[aria-label*='Next']", "a[title*='Næste']", "a[aria-label*='Næste']", "a[title*='Next']",
+        "button[title*='Næste']", "button[aria-label*='Næste']",
+        "button[title*='Next']", "button[aria-label*='Next']",
+        "a[title*='Næste']", "a[aria-label*='Næste']", "a[title*='Next']",
+        "button.z-calendar-next", "a.z-calendar-next", "span.z-cal-arrow-next",
+        "button.z-calendar-btn-right", "a.z-calendar-btn-right",
     ]
     for css in selectors:
         try:
@@ -367,14 +334,29 @@ def click_next(driver) -> bool:
                     return True
         except Exception:
             continue
-    return False
+    try:
+        return bool(driver.execute_script("""
+            var pats=[/n[æa]ste/i,/next/i];
+            var els=document.querySelectorAll('a,button,span,div');
+            for(var i=0;i<els.length;i++){
+              var t=(els[i].innerText||els[i].textContent||'').trim();
+              var title=(els[i].title||'').trim();
+              if((pats.some(p=>p.test(t)) || pats.some(p=>p.test(title))) && els[i].offsetParent!==null){els[i].click(); return true;}
+            }
+            return false;
+        """))
+    except Exception:
+        return False
 
 
 def click_prev(driver) -> bool:
     selectors = [
-        "div.arrowWrap[title*='Forrige']", "div.arrowWrap[title*='Prev']", "button[title*='Forrige']",
-        "button[aria-label*='Forrige']", "button[title*='Prev']", "button[aria-label*='Prev']",
-        "a[title*='Forrige']", "a[aria-label*='Forrige']", "div.arrow-left",
+        "div.arrowWrap[title*='Forrige']", "div.arrowWrap[title*='Prev']", "div.arrow-left",
+        "button[title*='Forrige']", "button[aria-label*='Forrige']",
+        "button[title*='Prev']", "button[aria-label*='Prev']",
+        "a[title*='Forrige']", "a[aria-label*='Forrige']",
+        "button.z-calendar-prev", "a.z-calendar-prev", "span.z-cal-arrow-prev",
+        "button.z-calendar-btn-left", "a.z-calendar-btn-left",
     ]
     for css in selectors:
         try:
@@ -384,26 +366,91 @@ def click_prev(driver) -> bool:
                     return True
         except Exception:
             continue
-    return False
+    try:
+        return bool(driver.execute_script("""
+            var pats=[/forrige/i,/prev/i,/tilbage/i,/back/i];
+            var els=document.querySelectorAll('a,button,span,div');
+            for(var i=0;i<els.length;i++){
+              var t=(els[i].innerText||els[i].textContent||'').trim();
+              var title=(els[i].title||'').trim();
+              if((pats.some(p=>p.test(t)) || pats.some(p=>p.test(title))) && els[i].offsetParent!==null){els[i].click(); return true;}
+            }
+            return false;
+        """))
+    except Exception:
+        return False
 
 
-def navigate_to_start_date_fallback(driver, target_date: date):
-    print("↩️ Falder tilbage til kalender-navigation...")
+def navigate_to_start_date(driver, fra: date):
+    frastr = fra.strftime("%d-%m-%Y")
+    print(f"📍 Sætter startdato i feltet: {frastr}")
+
+    for attempt in range(3):
+        el = find_visible(driver, DATE_INPUT_SELECTORS)
+        if not el:
+            time.sleep(1)
+            continue
+
+        current_val = (el.get_attribute("value") or "").strip()
+        print(f"   Datofelt fundet (forsøg {attempt + 1}), nuværende værdi: {current_val!r}")
+
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", el)
+            time.sleep(0.3)
+
+            driver.execute_script(
+                "var el=arguments[0], val=arguments[1];"
+                "el.focus();"
+                "el.value=val;"
+                "el.setAttribute('value', val);"
+                "el.dispatchEvent(new Event('input',{bubbles:true}));"
+                "el.dispatchEvent(new Event('change',{bubbles:true}));"
+                "el.dispatchEvent(new Event('blur',{bubbles:true}));",
+                el, frastr
+            )
+            time.sleep(0.4)
+
+            try:
+                el.send_keys(Keys.CONTROL, 'a')
+                el.send_keys(frastR if False else frastr)
+                el.send_keys(Keys.RETURN)
+            except Exception:
+                pass
+
+            time.sleep(1.5)
+            new_val = (el.get_attribute("value") or "").strip()
+            if frastr in new_val or new_val == frastr:
+                print(f"   ✅ Datofelt sat til {new_val}")
+                return True
+
+            try:
+                body = driver.find_element(By.TAG_NAME, 'body').text
+                if frastr in body:
+                    print("   ✅ Siden viser nu startdatoen")
+                    return True
+            except Exception:
+                pass
+
+            print(f"   ⚠️ Datofelt blev ikke bekræftet, læst værdi: {new_val!r}")
+        except Exception as e:
+            print(f"   ⚠️ Forsøg {attempt + 1} fejlede: {e}")
+        time.sleep(1)
+
+    print("   ⚠️ Kunne ikke sætte dato direkte i feltet — fallback til kalendernavigation")
     current = get_cal_date(driver)
-    if not current:
-        print("⚠️ Kunne ikke læse aktuel kalenderdato")
-        return
-    safety = 0
-    while current and current > target_date and safety < 400:
-        if not click_prev(driver):
-            break
-        time.sleep(0.5)
-        new_date = get_cal_date(driver)
-        if new_date == current:
-            break
-        current = new_date
-        safety += 1
-    print(f"📅 Kalender står nu på: {current}")
+    if current:
+        days_back = (current - fra).days
+        if 0 < days_back < 400:
+            print(f"   ↩️ Klikker Forrige ca. {days_back} gange som fallback")
+            for i in range(days_back):
+                if not click_prev(driver):
+                    print(f"   ⚠️ Forrige-klik stoppede efter {i} klik")
+                    break
+                time.sleep(0.1 if i % 10 != 0 else 0.4)
+            return True
+
+    print("   ⚠️ Startdato kunne ikke sættes")
+    return False
 
 
 def parse_page_body(body_text: str, year_hint: int) -> list:
@@ -462,7 +509,6 @@ def parse_page_body(body_text: str, year_hint: int) -> list:
         fravaer_val = info["fravaer"]
         day_tasks = [t for t in task_entries if t["date"] == d]
         is_fravaer = fravaer_val > 0
-
         if is_fravaer:
             type_text = "Ferie"
             for t in day_tasks:
@@ -476,7 +522,6 @@ def parse_page_body(body_text: str, year_hint: int) -> list:
                 if key not in seen_keys:
                     seen_keys.add(key)
                     entries.append({"date": d, "hours": total, "type": type_text, "raw": f"Fravær-dag: reg={reg_timer}, fravær={fravaer_val}"})
-
         elif day_tasks:
             task_sum = sum(t["hours"] for t in day_tasks)
             for t in day_tasks:
@@ -485,8 +530,7 @@ def parse_page_body(body_text: str, year_hint: int) -> list:
                     seen_keys.add(key)
                     entries.append({"date": d, "hours": t["hours"], "type": t["type"], "raw": t["raw"]})
             if reg_timer > 0 and abs(task_sum - reg_timer) > 0.1:
-                print(f" ⚠️ {d}: task-sum={task_sum:.2f}t ≠ reg_timer={reg_timer:.2f}t")
-
+                print(f"   ⚠️ {d}: task-sum={task_sum:.2f}t ≠ reg_timer={reg_timer:.2f}t")
         elif reg_timer > 0:
             key = (d, round(reg_timer, 2), "arbejde")
             if key not in seen_keys:
@@ -505,21 +549,28 @@ def parse_page_body(body_text: str, year_hint: int) -> list:
 
 
 def scrape_time_entries(driver, fra: date, til: date) -> list:
-    time.sleep(2)
-    if not set_start_date(driver, fra):
-        navigate_to_start_date_fallback(driver, fra)
-    time.sleep(2)
+    time.sleep(3)
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+        if "min plan" in body_text and "min tid" in body_text:
+            click_by_text(driver, ["Min tid", "MinTid", "Min Time", "My time"])
+            time.sleep(2)
+    except Exception:
+        pass
 
-    current_date = get_cal_date(driver) or fra
-    print(f"📍 Starter scraping fra kalenderdato: {current_date}")
+    print(f"📍 Navigerer til startdato: {fra}")
+    navigate_to_start_date(driver, fra)
+    time.sleep(2)
 
     all_entries = []
     seen_keys = set()
-    max_steps = (til - fra).days + 10
+    current_date = get_cal_date(driver) or fra
+    max_steps = (til - fra).days + 5
     step = 0
     last_body = None
     no_change_count = 0
 
+    print(f"⏳ Gennemgår dage fra {fra} til {til} ({(til - fra).days + 1} dage)")
     while step < max_steps:
         try:
             body_text = driver.find_element(By.TAG_NAME, "body").text
@@ -529,13 +580,16 @@ def scrape_time_entries(driver, fra: date, til: date) -> list:
         if body_text == last_body:
             no_change_count += 1
             if no_change_count >= 3:
-                print("⚠️ Siden ændrer sig ikke — stopper navigation")
+                print("   ⚠️ Siden ændrer sig ikke — stopper navigation")
                 break
         else:
             no_change_count = 0
             last_body = body_text
 
-        page_entries = parse_page_body(body_text, current_date.year)
+        progress_pct = min(100, int(((step + 1) / max_steps) * 100))
+        print(f"   → Dag {step + 1}/{max_steps} | dato: {current_date} | fundet indtil nu: {len(all_entries)} poster | {progress_pct}%")
+        year_hint = current_date.year
+        page_entries = parse_page_body(body_text, year_hint)
         for e in page_entries:
             d = e.get("date")
             h = round(float(e.get("hours", 0) or 0), 2)
@@ -544,18 +598,21 @@ def scrape_time_entries(driver, fra: date, til: date) -> list:
             if key not in seen_keys:
                 seen_keys.add(key)
                 all_entries.append(e)
-                print(f"✅ {d}: {h}t ({classify(e.get('type', ''))}) — {str(e.get('type', ''))[:50]}")
+                print(f"      ✅ Ny post: {d} | {h:.2f} t | {classify(e.get('type',''))} | {str(e.get('type',''))[:50]}")
 
         if current_date >= til:
             break
-
-        if not click_next(driver):
-            print("⚠️ Kunne ikke klikke Næste — stopper")
+        print(f"   ↪ Går videre til næste dag fra {current_date}...")
+        clicked = click_next(driver)
+        if not clicked:
+            print("   ⚠️ Kunne ikke klikke Næste — stopper")
             break
-
         time.sleep(0.8)
         new_date = get_cal_date(driver)
-        current_date = new_date if new_date and new_date != current_date else current_date + timedelta(days=1)
+        if new_date and new_date != current_date:
+            current_date = new_date
+        else:
+            current_date = current_date + timedelta(days=1)
         step += 1
 
     print(f"\n✅ Navigation færdig — {len(all_entries)} poster fundet")
@@ -570,292 +627,237 @@ def filter_entries_by_date(entries: list, fra: date, til: date) -> list:
         h = round(float(e.get("hours", 0) or 0), 2)
         t = str(e.get("type", "")).strip().lower()[:40]
         key = (d, h, t)
-        if d is None or not (fra <= d <= til):
+        if d is not None and not (fra <= d <= til):
             continue
         if key in seen_keys:
             continue
         seen_keys.add(key)
         filtered.append(e)
-    return sorted(filtered, key=lambda x: (x.get("date"), str(x.get("type") or "")))
+    return filtered
 
 
-def summarize_entries(entries: list):
-    totals = defaultdict(float)
-    monthly = defaultdict(lambda: defaultdict(float))
-    details = []
+def entries_to_dataframe(entries):
+    rows = []
     for e in entries:
         d = e.get("date") if isinstance(e.get("date"), date) else parse_date_any(str(e.get("date") or ""))
+        typ = str(e.get("type") or "Ukendt")
+        kat = classify(typ)
+        hours = round(float(e.get("hours", 0) or 0), 2)
+        rows.append({
+            "dato": d.isoformat() if d else "",
+            "kategori": kat,
+            "type": typ,
+            "timer": hours,
+            "rå": str(e.get("raw") or "")
+        })
+    return pd.DataFrame(rows)
+
+
+def build_summary(entries):
+    totals = defaultdict(float)
+    monthly = defaultdict(lambda: defaultdict(float))
+    for e in entries:
         hours = float(e.get("hours", 0) or 0)
-        type_text = str(e.get("type") or "")
-        category = classify(type_text)
-        totals[category] += hours
-        if d:
-            monthly[d.strftime("%Y-%m")][category] += hours
-            details.append({
-                "date": d,
-                "category": category,
-                "hours": hours,
-                "type": type_text,
-                "raw": str(e.get("raw") or "")
-            })
-    return totals, monthly, sorted(details, key=lambda x: (x["date"], x["category"], x["type"]))
+        cat = classify(str(e.get("type", "")))
+        d = e.get("date") if isinstance(e.get("date"), date) else parse_date_any(str(e.get("date") or ""))
+        month_key = d.strftime("%Y-%m") if d else "ukendt"
+        totals[cat] += hours
+        monthly[month_key][cat] += hours
+    arbejde = round(totals.get("Arbejde", 0.0), 2)
+    ferie = round(totals.get("Ferie", 0.0), 2)
+    sygdom = round(totals.get("Sygdom", 0.0), 2)
+    total = round(arbejde + ferie + sygdom, 2)
+    months = []
+    for m in sorted(monthly.keys()):
+        d = monthly[m]
+        t = round(sum(d.values()), 2)
+        months.append({
+            "måned": m,
+            "arbejde": round(d.get("Arbejde", 0.0), 2),
+            "ferie": round(d.get("Ferie", 0.0), 2),
+            "sygdom": round(d.get("Sygdom", 0.0), 2),
+            "total": t,
+        })
+    return {"arbejde": arbejde, "ferie": ferie, "sygdom": sygdom, "total": total, "months": months}
 
 
 def print_rapport(entries: list, fra: date, til: date, vis_typer: bool = False):
     if not entries:
         print("\n⚠️ Ingen tidsregistreringer fundet.")
+        print("   Prøv --no-headless og tjek at kalenderen viser startdatoen korrekt.")
         return
-
-    totals, monthly, _ = summarize_entries(entries)
-    arbejde = totals.get("Arbejde", 0.0)
-    ferie = totals.get("Ferie", 0.0)
-    sygdom = totals.get("Sygdom", 0.0)
-    total = arbejde + ferie + sygdom
-
+    summary = build_summary(entries)
     print("\n" + "═" * 62)
-    print(" MINUBA TIMER OVERSIGT")
-    print(f" Periode: {fra} → {til}")
+    print("  MINUBA TIMER OVERSIGT")
+    print(f"  Periode: {fra} → {til}")
     print("═" * 62)
-    print(f" {'Arbejdstimer':<24} {arbejde:>8.2f} t")
-    print(f" {'Ferie':<24} {ferie:>8.2f} t")
-    print(f" {'Sygdom':<24} {sygdom:>8.2f} t")
-    print(" " + "─" * 34)
-    print(f" {'TOTAL':<24} {total:>8.2f} t")
+    print(f"  {'Arbejdstimer':<24} {summary['arbejde']:>8.2f} t")
+    print(f"  {'Ferie':<24} {summary['ferie']:>8.2f} t")
+    print(f"  {'Sygdom':<24} {summary['sygdom']:>8.2f} t")
+    print("  " + "─" * 34)
+    print(f"  {'TOTAL':<24} {summary['total']:>8.2f} t")
     print("═" * 62)
-
-    if len(monthly) > 1:
-        print("\n MÅNEDSOPDELING:")
-        print(" " + "─" * 58)
-        print(f" {'Måned':<10} {'Arbejde':>10} {'Ferie':>10} {'Sygdom':>10} {'Total':>10}")
-        print(" " + "─" * 58)
-        for m in sorted(monthly.keys()):
-            d2 = monthly[m]
-            t2 = sum(d2.values())
-            print(f" {m:<10} {d2.get('Arbejde',0):>10.2f} {d2.get('Ferie',0):>10.2f} {d2.get('Sygdom',0):>10.2f} {t2:>10.2f}")
-
+    if len(summary['months']) > 1:
+        print("\n  MÅNEDSOPDELING:")
+        print("  " + "─" * 58)
+        print(f"  {'Måned':<10} {'Arbejde':>10} {'Ferie':>10} {'Sygdom':>10} {'Total':>10}")
+        print("  " + "─" * 58)
+        for m in summary['months']:
+            print(f"  {m['måned']:<10} {m['arbejde']:>10.2f} {m['ferie']:>10.2f} {m['sygdom']:>10.2f} {m['total']:>10.2f}")
     if vis_typer:
         type_totals = defaultdict(float)
         for e in entries:
             t3 = str(e.get("type") or "Ukendt")
             type_totals[t3] += float(e.get("hours", 0) or 0)
-        print("\n ALLE TYPER FUNDET:")
-        print(" " + "─" * 60)
+        print("\n  ALLE TYPER FUNDET:")
+        print("  " + "─" * 60)
         for t3, h in sorted(type_totals.items(), key=lambda x: -x[1]):
-            print(f" [{classify(t3):8s}] {t3:<40} {h:>7.2f} t")
+            print(f"  [{classify(t3):8s}] {t3:<40} {h:>7.2f} t")
 
 
-def export_csv(entries: list, csv_path: str):
-    path = Path(csv_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f, delimiter=';')
-        writer.writerow(["Dato", "Kategori", "Timer", "Type", "Rå tekst"])
-        for e in entries:
-            d = e.get("date")
-            d_text = d.strftime("%Y-%m-%d") if isinstance(d, date) else str(d or "")
-            type_text = str(e.get("type") or "")
-            writer.writerow([d_text, classify(type_text), format_hours(e.get("hours", 0)), type_text, str(e.get("raw") or "")])
+def render_html_report(df, summary, fra, til, navn=None, virksomhed=None, timeløn=None, kommentar=None):
+    generated = datetime.now().strftime("%Y-%m-%d %H:%M")
+    rows_html = "".join(
+        f"<tr><td>{r['dato']}</td><td>{r['kategori']}</td><td>{r['type']}</td><td class='num'>{float(r['timer']):.2f}</td></tr>"
+        for _, r in df.sort_values(["dato", "kategori", "type"]).iterrows()
+    ) if not df.empty else "<tr><td colspan='4'>Ingen registreringer fundet.</td></tr>"
+    month_html = "".join(
+        f"<tr><td>{m['måned']}</td><td class='num'>{m['arbejde']:.2f}</td><td class='num'>{m['ferie']:.2f}</td><td class='num'>{m['sygdom']:.2f}</td><td class='num'>{m['total']:.2f}</td></tr>"
+        for m in summary['months']
+    ) if summary['months'] else "<tr><td colspan='5'>Ingen månedsopdeling tilgængelig.</td></tr>"
 
-
-class ReportPDF(FPDF):
-    def header(self):
-        self.set_fill_color(21, 68, 94)
-        self.rect(0, 0, 210, 22, style='F')
-        self.set_text_color(255, 255, 255)
-        self.set_font("Helvetica", "B", 16)
-        self.set_xy(12, 7)
-        self.cell(0, 8, "Minuba Løncheck Rapport")
-        self.ln(18)
-        self.set_text_color(0, 0, 0)
-
-    def footer(self):
-        self.set_y(-12)
-        self.set_font("Helvetica", "I", 8)
-        self.set_text_color(110, 110, 110)
-        self.cell(0, 8, f"Side {self.page_no()}", align="C")
-
-
-def pdf_section_title(pdf, title):
-    pdf.ln(3)
-    pdf.set_fill_color(230, 236, 242)
-    pdf.set_draw_color(200, 210, 220)
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 8, title, new_x="LMARGIN", new_y="NEXT", fill=True)
-    pdf.ln(1)
-
-
-def pdf_key_value(pdf, label, value, label_w=45):
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(label_w, 7, f"{label}:")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 7, str(value), new_x="LMARGIN", new_y="NEXT")
-
-
-def pdf_summary_table(pdf, totals, timeløn=None):
-    arbejde = totals.get("Arbejde", 0.0)
-    ferie = totals.get("Ferie", 0.0)
-    sygdom = totals.get("Sygdom", 0.0)
-    total = arbejde + ferie + sygdom
-    rows = [
-        ("Arbejdstimer", arbejde),
-        ("Ferie", ferie),
-        ("Sygdom", sygdom),
-        ("Total", total),
-    ]
+    løn_html = ""
     if timeløn is not None:
-        try:
-            løn = float(str(timeløn).replace(",", ".")) * arbejde
-            rows.append(("Foreløbig løn (arbejde x timeløn)", løn, "kr"))
-        except Exception:
-            pass
+        forventet = round(summary['arbejde'] * timeløn, 2)
+        løn_html = f"""
+        <div class='card'>
+          <h2>Foreløbig lønberegning</h2>
+          <p>Ved en oplyst timeløn på <strong>{timeløn:.2f} kr.</strong> giver arbejdstimerne en forventet grundløn på <strong>{forventet:.2f} kr.</strong>.</p>
+          <p class='muted'>Beløbet tager ikke automatisk højde for pension, tillæg, fritvalg, feriepenge, SH/FV, overarbejde eller lokale aftaler.</p>
+        </div>
+        """
 
-    col1 = 105
-    col2 = 35
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.set_fill_color(240, 240, 240)
-    pdf.cell(col1, 8, "Post", border=1, fill=True)
-    pdf.cell(col2, 8, "Værdi", border=1, fill=True, align="R")
-    pdf.cell(25, 8, "Enhed", border=1, fill=True, align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "", 10)
-    for idx, row in enumerate(rows):
-        label = row[0]
-        value = row[1]
-        unit = row[2] if len(row) > 2 else "timer"
-        if idx % 2 == 0:
-            pdf.set_fill_color(250, 250, 250)
-            fill = True
-        else:
-            fill = False
-        pdf.cell(col1, 8, label, border=1, fill=fill)
-        pdf.cell(col2, 8, format_hours(value) if unit == "timer" else f"{value:.2f}", border=1, fill=fill, align="R")
-        pdf.cell(25, 8, unit, border=1, fill=fill, align="C", new_x="LMARGIN", new_y="NEXT")
+    kommentar_html = f"<div class='card'><h2>Kommentar</h2><p>{kommentar}</p></div>" if kommentar else ""
+
+    return f"""
+<!doctype html>
+<html lang='da'>
+<head>
+<meta charset='utf-8'>
+<title>Lønkontrol rapport</title>
+<style>
+  @page {{ size: A4; margin: 16mm; }}
+  body {{ font-family: Arial, sans-serif; color:#1f2937; font-size:12px; line-height:1.45; }}
+  h1,h2,h3 {{ margin:0 0 8px 0; color:#0f172a; }}
+  h1 {{ font-size:24px; }}
+  h2 {{ font-size:16px; margin-top:18px; }}
+  .top {{ display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:16px; }}
+  .brand {{ font-weight:700; color:#0f766e; font-size:14px; }}
+  .muted {{ color:#6b7280; }}
+  .grid {{ display:grid; grid-template-columns: repeat(2, 1fr); gap:10px; margin:14px 0; }}
+  .grid4 {{ display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin:14px 0; }}
+  .card {{ border:1px solid #d1d5db; border-radius:8px; padding:10px 12px; background:#f8fafc; }}
+  .kpi {{ font-size:22px; font-weight:700; margin-top:6px; }}
+  table {{ width:100%; border-collapse:collapse; margin-top:8px; }}
+  th, td {{ border:1px solid #d1d5db; padding:7px 8px; vertical-align:top; }}
+  th {{ background:#e2e8f0; text-align:left; }}
+  .num {{ text-align:right; white-space:nowrap; }}
+  .small {{ font-size:10px; }}
+  .note {{ background:#fff7ed; border:1px solid #fdba74; border-radius:8px; padding:10px 12px; margin-top:14px; }}
+  .footer {{ margin-top:18px; font-size:10px; color:#6b7280; }}
+</style>
+</head>
+<body>
+  <div class='top'>
+    <div>
+      <div class='brand'>Lønkontrol rapport</div>
+      <h1>Timer fra Minuba</h1>
+      <div class='muted'>Periode: {fra} til {til}</div>
+    </div>
+    <div class='small muted'>Genereret: {generated}</div>
+  </div>
+
+  <div class='grid'>
+    <div class='card'><strong>Navn</strong><br>{navn or 'Ikke angivet'}</div>
+    <div class='card'><strong>Virksomhed</strong><br>{virksomhed or 'Ikke angivet'}</div>
+  </div>
+
+  <div class='grid4'>
+    <div class='card'><div>Arbejdstimer</div><div class='kpi'>{summary['arbejde']:.2f} t</div></div>
+    <div class='card'><div>Ferie</div><div class='kpi'>{summary['ferie']:.2f} t</div></div>
+    <div class='card'><div>Sygdom</div><div class='kpi'>{summary['sygdom']:.2f} t</div></div>
+    <div class='card'><div>Total</div><div class='kpi'>{summary['total']:.2f} t</div></div>
+  </div>
+
+  {løn_html}
+  {kommentar_html}
+
+  <div class='card'>
+    <h2>Formål</h2>
+    <p>Denne rapport er lavet som dokumentation til gennemgang af registrerede timer og kan bruges som bilag ved forespørgsel om lønkontrol, herunder ved henvendelse til Dansk El-Forbund.</p>
+    <p>Scriptet er udviklet uafhængigt og er ikke officielt tilknyttet Minuba eller Dansk El-Forbund. Det er baseret på data hentet direkte fra brugerens Minuba-konto og kategoriserer timerne ud fra de typer og beskrivelser, der findes i registreringerne.</p>
+    <p>Scriptet er udviklet af Benjamin Kallehave</p>
+  </div>
+
+  <h2>Månedsopdeling</h2>
+  <table>
+    <thead>
+      <tr><th>Måned</th><th class='num'>Arbejde</th><th class='num'>Ferie</th><th class='num'>Sygdom</th><th class='num'>Total</th></tr>
+    </thead>
+    <tbody>{month_html}</tbody>
+  </table>
+
+  <h2>Detaljerede registreringer</h2>
+  <table>
+    <thead>
+      <tr><th>Dato</th><th>Kategori</th><th>Type</th><th class='num'>Timer</th></tr>
+    </thead>
+    <tbody>{rows_html}</tbody>
+  </table>
+
+  <div class='note'>
+    <strong>Bemærkning:</strong> Kategorisering af ferie og sygdom er lavet ud fra navne/typer fundet i registreringerne. Hvis virksomheden bruger andre betegnelser, bør rapporten gennemgås manuelt før den sendes videre.
+  </div>
+
+  <div class='footer'>
+    Rapporten er genereret automatisk på baggrund af registreringer hentet fra Minuba via brugerens login. Dokumentet er tænkt som støtte til lønkontrol og bør sammenholdes med lønsedler, timeløn, overenskomst og eventuelle tillæg.
+  </div>
+</body>
+</html>
+"""
 
 
-def pdf_monthly_table(pdf, monthly):
-    if not monthly:
-        return
-    widths = [35, 35, 35, 35, 35]
-    headers = ["Måned", "Arbejde", "Ferie", "Sygdom", "Total"]
-    pdf.set_font("Helvetica", "B", 9)
-    pdf.set_fill_color(240, 240, 240)
-    for w, h in zip(widths, headers):
-        pdf.cell(w, 8, h, border=1, fill=True, align="C")
-    pdf.ln()
-    pdf.set_font("Helvetica", "", 9)
-    for i, month in enumerate(sorted(monthly.keys())):
-        m = monthly[month]
-        total = m.get("Arbejde", 0) + m.get("Ferie", 0) + m.get("Sygdom", 0)
-        values = [month, format_hours(m.get("Arbejde", 0)), format_hours(m.get("Ferie", 0)), format_hours(m.get("Sygdom", 0)), format_hours(total)]
-        if i % 2 == 0:
-            pdf.set_fill_color(250, 250, 250)
-            fill = True
-        else:
-            fill = False
-        for w, val in zip(widths, values):
-            align = "L" if w == widths[0] else "R"
-            pdf.cell(w, 7, str(val), border=1, fill=fill, align=align)
-        pdf.ln()
-
-
-def pdf_detail_table(pdf, details):
-    if not details:
-        pdf.set_font("Helvetica", "", 10)
-        pdf.multi_cell(0, 6, "Ingen poster fundet i valgt periode.")
-        return
-
-    widths = [24, 28, 20, 118]
-    headers = ["Dato", "Kategori", "Timer", "Type / registrering"]
-
-    def print_header():
-        pdf.set_font("Helvetica", "B", 8)
-        pdf.set_fill_color(240, 240, 240)
-        for w, h in zip(widths, headers):
-            align = "C" if h != "Type / registrering" else "L"
-            pdf.cell(w, 8, h, border=1, fill=True, align=align)
-        pdf.ln()
-
-    print_header()
-    pdf.set_font("Helvetica", "", 8)
-
-    for i, row in enumerate(details):
-        if pdf.get_y() > 268:
-            pdf.add_page()
-            print_header()
-            pdf.set_font("Helvetica", "", 8)
-
-        date_str = row["date"].strftime("%Y-%m-%d")
-        category = row["category"]
-        hours = format_hours(row["hours"])
-        type_text = row["type"] or row["raw"] or "-"
-        if len(type_text) > 72:
-            type_text = type_text[:69] + "..."
-
-        if i % 2 == 0:
-            pdf.set_fill_color(250, 250, 250)
-            fill = True
-        else:
-            fill = False
-
-        line_h = 7
-        pdf.cell(widths[0], line_h, date_str, border=1, fill=fill)
-        pdf.cell(widths[1], line_h, category, border=1, fill=fill)
-        pdf.cell(widths[2], line_h, hours, border=1, fill=fill, align="R")
-        pdf.multi_cell(widths[3], line_h, type_text, border=1, fill=fill)
-
-
-def generate_pdf_report(pdf_path, entries, fra, til, navn="", virksomhed="", timeløn=None):
-    path = Path(pdf_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    totals, monthly, details = summarize_entries(entries)
-
-    pdf = ReportPDF("P", "mm", "A4")
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-
-    pdf.set_font("Helvetica", "", 10)
-    pdf_key_value(pdf, "Periode", f"{fra} til {til}")
-    if navn:
-        pdf_key_value(pdf, "Navn", navn)
-    if virksomhed:
-        pdf_key_value(pdf, "Virksomhed", virksomhed)
-    pdf_key_value(pdf, "Genereret", datetime.now().strftime("%Y-%m-%d %H:%M"))
-
-    pdf_section_title(pdf, "Oversigt")
-    pdf_summary_table(pdf, totals, timeløn=timeløn)
-
-    pdf_section_title(pdf, "Månedsopdeling")
-    pdf_monthly_table(pdf, monthly)
-
-    pdf_section_title(pdf, "Detaljerede registreringer")
-    pdf_detail_table(pdf, details)
-
-    pdf.ln(4)
-    pdf.set_font("Helvetica", "I", 9)
-    pdf.set_text_color(90, 90, 90)
-    pdf.multi_cell(
-        0,
-        5,
-        "Bemærk: Rapporten er baseret på registreringer fra Minuba 'Min Tid' og er tænkt som kontrolgrundlag. "
-        "Tallene bør sammenholdes med lønseddel, eventuelle tillæg, overtid, pension, SH/feriefridage og gældende overenskomst ved et egentligt løncheck."
-    )
-    pdf.output(str(path))
+def save_pdf_report(html, output_pdf):
+    if HTML is None:
+        print("❌ WeasyPrint er ikke installeret. Installer fx: sudo pacman -S python-weasyprint")
+        sys.exit(1)
+    HTML(string=html).write_pdf(output_pdf)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Henter timer fra Minuba (Min Tid).")
+    parser = argparse.ArgumentParser(
+        description="Henter timer fra Minuba (Min Tid) og kan lave PDF-rapport.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+EKSEMPLER:
+python minuba_timer.py --email din@email.dk --adgangskode DinKode --periode 2025-04
+python minuba_timer.py --email din@email.dk --adgangskode DinKode --periode 2025-04 --pdf april.pdf
+python minuba_timer.py --email din@email.dk --adgangskode DinKode --fra 2025-01-01 --til 2025-03-31 --pdf q1.pdf --navn 'Dit Navn' --virksomhed 'Firma ApS' --timeløn 220
+"""
+    )
     parser.add_argument("--email", required=False)
     parser.add_argument("--adgangskode", required=False)
     parser.add_argument("--periode", default=None)
     parser.add_argument("--fra", default=None)
     parser.add_argument("--til", default=None)
-    parser.add_argument("--navn", default="")
-    parser.add_argument("--virksomhed", default="")
-    parser.add_argument("--timeløn", default=None)
-    parser.add_argument("--pdf", default=None)
-    parser.add_argument("--csv", default=None)
     parser.add_argument("--no-headless", action="store_true")
     parser.add_argument("--vis-typer", action="store_true")
+    parser.add_argument("--pdf", default=None, help="Gem rapport som PDF, fx rapport.pdf")
+    parser.add_argument("--csv", default=None, help="Gem detaljer som CSV")
+    parser.add_argument("--navn", default=None)
+    parser.add_argument("--virksomhed", default=None)
+    parser.add_argument("--timeløn", type=float, default=None)
+    parser.add_argument("--kommentar", default=None)
     args = parser.parse_args()
 
     if not args.email:
@@ -864,7 +866,7 @@ def main():
         args.adgangskode = getpass.getpass("Adgangskode: ").strip()
     if not args.email or not args.adgangskode:
         print("❌ Email og adgangskode er påkrævet")
-        return 1
+        sys.exit(1)
 
     fra, til = get_date_range(args.periode, args.fra, args.til)
     print(f"\n📅 Periode: {fra} → {til}")
@@ -877,18 +879,23 @@ def main():
         entries = scrape_time_entries(driver, fra, til)
         if entries:
             entries = filter_entries_by_date(entries, fra, til)
-            print(f" → {len(entries)} poster i perioden.")
+            print(f"   → {len(entries)} poster i perioden.")
         print_rapport(entries, fra, til, vis_typer=args.vis_typer)
-        if args.csv:
-            export_csv(entries, args.csv)
-            print(f"📊 CSV gemt: {args.csv}")
-        if args.pdf:
-            generate_pdf_report(args.pdf, entries, fra, til, navn=args.navn, virksomhed=args.virksomhed, timeløn=args.timeløn)
-            print(f"📄 PDF gemt: {args.pdf}")
     finally:
         driver.quit()
-    return 0
+
+    df = entries_to_dataframe(entries)
+    summary = build_summary(entries)
+
+    if args.csv:
+        df.to_csv(args.csv, index=False)
+        print(f"💾 CSV gemt: {args.csv}")
+
+    if args.pdf:
+        html = render_html_report(df, summary, fra, til, navn=args.navn, virksomhed=args.virksomhed, timeløn=args.timeløn, kommentar=args.kommentar)
+        save_pdf_report(html, args.pdf)
+        print(f"🧾 PDF gemt: {args.pdf}")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
