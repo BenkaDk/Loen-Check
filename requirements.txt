@@ -3,3 +3,4 @@ pdfplumber
 fpdf2
 rich
 tk
+reportlab

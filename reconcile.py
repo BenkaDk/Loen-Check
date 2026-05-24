@@ -7,8 +7,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fpdf import FPDF
-from fpdf.enums import XPos, YPos
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_CENTER
+
+
+PRIMARY_DARK = colors.HexColor("#1a1a2e")
+PRIMARY_MID = colors.HexColor("#16213e")
+ACCENT = colors.HexColor("#0f3460")
+RED = colors.HexColor("#e94560")
+GREEN = colors.HexColor("#25a244")
+LIGHT_BG = colors.HexColor("#f4f6f9")
+MID_GRAY = colors.HexColor("#8892a4")
+WHITE = colors.white
+TEXT = colors.HexColor("#1c1c2e")
 
 
 def normalize_decimal(value) -> Optional[float]:
@@ -94,21 +109,16 @@ def load_payslip_csv(path: Path):
         reader = csv.DictReader(f)
         for row in reader:
             result["rows"].append(row)
-            work = normalize_decimal(
-                row.get("arbejdstimer") or row.get("hours") or row.get("timer") or 0
-            ) or 0.0
+            work = normalize_decimal(row.get("arbejdstimer") or row.get("hours") or row.get("timer") or 0) or 0.0
             result["work_hours"] += work
-
             sick_days = normalize_decimal(row.get("sygdom_days") or row.get("sygedage") or row.get("sick_days") or 0) or 0.0
             sick_date = parse_date(row.get("date") or row.get("dato") or row.get("day") or row.get("Date"))
             if sick_days:
                 result["sick_hours"] += sick_hours_from_days(sick_days, sick_date)
-
             gross = normalize_decimal(row.get("brutto") or row.get("gross") or 0) or 0.0
             net = normalize_decimal(row.get("netto") or row.get("net") or 0) or 0.0
             sh = normalize_decimal(row.get("sh") or row.get("sh_amount") or row.get("savings") or row.get("opsparing") or 0) or 0.0
             other = normalize_decimal(row.get("andre_fradrag") or row.get("other_deductions") or 0) or 0.0
-
             result["gross_salary"] += gross
             result["net_salary"] += net
             result["sh_amount"] += sh
@@ -126,18 +136,21 @@ def reconcile(minuba, payslip, hourly_rate):
 
     if hour_diff > 0:
         status = "De skylder dig"
+        title = f"De skylder dig: {abs(money_diff):,.2f} kr.".replace(",", "X").replace(".", ",").replace("X", ".")
         conclusion = (
             f"Minuba viser {minuba_total:.2f} betalte timer i alt, mens lønsedlen viser {payslip_total:.2f}. "
             f"Der mangler derfor {hour_diff:.2f} timer, svarende til {money_diff:.2f} kr. før skat og fradrag."
         )
     elif hour_diff < 0:
         status = "Du skylder dem"
+        title = f"Du skylder dem: {abs(money_diff):,.2f} kr.".replace(",", "X").replace(".", ",").replace("X", ".")
         conclusion = (
             f"Lønsedlen viser {payslip_total:.2f} betalte timer i alt, mens Minuba viser {minuba_total:.2f}. "
             f"Der er derfor {abs(hour_diff):.2f} timer for meget, svarende til {abs(money_diff):.2f} kr. før skat og fradrag."
         )
     else:
         status = "Timerne matcher"
+        title = "Timerne matcher"
         conclusion = f"Minuba og lønsedlens betalte timer matcher præcist: {minuba_total:.2f} timer."
 
     summary = (
@@ -151,6 +164,7 @@ def reconcile(minuba, payslip, hourly_rate):
 
     return {
         "status": status,
+        "title": title,
         "minuba_work_hours": round(minuba["work_hours"], 2),
         "minuba_sick_hours": round(minuba["sick_hours"], 2),
         "minuba_total_hours": minuba_total,
@@ -186,82 +200,155 @@ def write_json(data, path: Path):
 
 
 def make_pdf(data, path: Path, hourly_rate: float):
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle("titlex", fontName="Helvetica-Bold", fontSize=22, textColor=WHITE, alignment=TA_LEFT, leading=24))
+    styles.add(ParagraphStyle("subx", fontName="Helvetica", fontSize=10, textColor=colors.HexColor("#aab4c8"), alignment=TA_LEFT, leading=12))
+    styles.add(ParagraphStyle("headx", fontName="Helvetica-Bold", fontSize=11, textColor=ACCENT, leading=13, spaceAfter=3))
+    styles.add(ParagraphStyle("bodyx", fontName="Helvetica", fontSize=9.5, textColor=TEXT, leading=14))
+    styles.add(ParagraphStyle("smallx", fontName="Helvetica", fontSize=8.5, textColor=MID_GRAY, leading=12))
+    styles.add(ParagraphStyle("verdictx", fontName="Helvetica-Bold", fontSize=26, textColor=WHITE, alignment=TA_CENTER, leading=30))
+    styles.add(ParagraphStyle("verdicts", fontName="Helvetica", fontSize=10, textColor=colors.HexColor("#d0d8e8"), alignment=TA_CENTER, leading=12))
 
-    pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(0, 10, "Aarsbaseret loencheck", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(2)
+    doc = SimpleDocTemplate(str(path), pagesize=A4, leftMargin=14 * mm, rightMargin=14 * mm, topMargin=10 * mm, bottomMargin=12 * mm)
+    story = []
 
-    pdf.set_font("Helvetica", "", 10)
-    pdf.multi_cell(
-        0,
-        6,
-        "Denne rapport sammenligner arbejdstimer og sygetimer fra Minuba med de samlede betalte timer på lønsedlerne. "
-        "Ferie-timer er ikke medregnet, da de er selvbetalte. Sygedage i lønsedlen omregnes til timer, så de kan sammenlignes med Minubas timeregistrering."
-    )
-    pdf.ln(2)
+    header = Table([
+        [Paragraph("Løncheck Rapport", styles["titlex"]), Paragraph(datetime.today().strftime("Genereret %d/%m/%Y"), styles["subx"])],
+    ], colWidths=[120 * mm, 63 * mm])
+    header.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), PRIMARY_DARK),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10 * mm),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6 * mm),
+        ("TOPPADDING", (0, 0), (-1, -1), 7 * mm),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7 * mm),
+        ("ROUNDEDCORNERS", [4, 4, 4, 4]),
+    ]))
+    story.append(header)
+    story.append(Spacer(1, 5 * mm))
 
-    if data["hour_diff"] > 0:
-        pdf.set_fill_color(70, 170, 70)
-        headline = f"De skylder dig: {money(data['money_diff'])} kr."
-        txt = (255, 255, 255)
-    elif data["hour_diff"] < 0:
-        pdf.set_fill_color(255, 70, 70)
-        headline = f"Du skylder dem: {money(abs(data['money_diff']))} kr."
-        txt = (255, 255, 255)
-    else:
-        pdf.set_fill_color(220, 220, 220)
-        headline = "Timerne matcher"
-        txt = (0, 0, 0)
+    verdict_color = RED if data["hour_diff"] < 0 else GREEN if data["hour_diff"] > 0 else ACCENT
+    verdict_amount = f"{money(abs(data['money_diff']))} kr." if data["hour_diff"] != 0 else "0,00 kr."
+    verdict = Table([
+        [Paragraph(data["title"], styles["verdicts"])],
+        [Paragraph(verdict_amount, styles["verdictx"])],
+        [Paragraph("Difference baseret på timer og timeløn", styles["verdicts"])],
+    ], colWidths=[183 * mm])
+    verdict.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), verdict_color),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4 * mm),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4 * mm),
+        ("ROUNDEDCORNERS", [6, 6, 6, 6]),
+    ]))
+    story.append(verdict)
+    story.append(Spacer(1, 5 * mm))
 
-    pdf.set_text_color(*txt)
-    pdf.set_font("Helvetica", "B", 22)
-    pdf.cell(0, 18, headline, border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C", fill=True)
-    pdf.set_text_color(0, 0, 0)
-    pdf.ln(3)
+    def stat_cell(label, value, alert=False):
+        val_style = ParagraphStyle("valx", fontName="Helvetica-Bold", fontSize=13, textColor=RED if alert else TEXT, leading=15)
+        return [Paragraph(label, ParagraphStyle("lblx", fontName="Helvetica-Bold", fontSize=9, textColor=MID_GRAY, leading=11)), Paragraph(value, val_style)]
 
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 8, "Sammenligning", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 6, f"Minuba arbejdstimer: {money(data['minuba_work_hours'])}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 6, f"Minuba sygetimer: {money(data['minuba_sick_hours'])}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 6, f"Minuba total betalte timer: {money(data['minuba_total_hours'])}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 6, f"Lønseddel arbejdstimer: {money(data['payslip_work_hours'])}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 6, f"Lønseddel sygetimer: {money(data['payslip_sick_hours'])}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 6, f"Lønseddel total betalte timer: {money(data['payslip_total_hours'])}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 6, f"Forskel i timer: {money(data['hour_diff'])}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 6, f"Timeloen: {money(hourly_rate)} kr.", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 6, f"Forventet bruttoloen: {money(data['expected_gross'])}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 6, f"Faktisk bruttoloen: {money(data['gross_salary'])}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 6, f"SH/opsparing: {money(data['sh_amount'])} | Andre fradrag: {money(data['other_deductions'])}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(3)
+    stats = [
+        [stat_cell("MINUBA ARBEJDSTIMER", money(data["minuba_work_hours"])), stat_cell("LØNSEDDEL ARBEJDSTIMER", money(data["payslip_work_hours"]))],
+        [stat_cell("MINUBA SYGETIMER", money(data["minuba_sick_hours"])), stat_cell("LØNSEDDEL SYGETIMER", money(data["payslip_sick_hours"]))],
+        [stat_cell("MINUBA TOTAL BETALTE TIMER", money(data["minuba_total_hours"])), stat_cell("LØNSEDDEL TOTAL BETALTE TIMER", money(data["payslip_total_hours"]))],
+        [stat_cell("FORSKEL I TIMER", money(data["hour_diff"]), True), stat_cell("FORSKEL I KRONER", f"{money(data['money_diff'])} kr.", True)],
+    ]
+    stat_tables = []
+    for row in stats:
+        inner_row = []
+        for label, value in row:
+            inner = Table([[label], [value]], colWidths=[88 * mm])
+            inner.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), LIGHT_BG),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5 * mm),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4 * mm),
+                ("TOPPADDING", (0, 0), (-1, -1), 3.5 * mm),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5 * mm),
+                ("ROUNDEDCORNERS", [4, 4, 4, 4]),
+            ]))
+            inner_row.append(inner)
+        stat_tables.append(inner_row)
+    stats_tbl = Table(stat_tables, colWidths=[91.5 * mm, 91.5 * mm])
+    stats_tbl.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 1.5 * mm),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5 * mm),
+    ]))
+    story.append(stats_tbl)
+    story.append(Spacer(1, 5 * mm))
 
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 8, "Forklaring", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.multi_cell(
-        0,
-        6,
-        "Reglen er: Hvis lønsedlens samlede betalte timer er højere end Minubas samlede betalte timer, så er der betalt for meget. "
-        "Hvis Minuba viser flere betalte timer end lønsedlen, så mangler der betaling. Ferie er udeladt, mens sygdom er medregnet via en omregning fra dage til timer."
-    )
-    pdf.ln(2)
+    story.append(Paragraph("LØNDETALJER", styles["headx"]))
+    story.append(HRFlowable(width="100%", thickness=1, color=ACCENT, spaceAfter=3 * mm))
+    lon_data = [
+        [Paragraph("POST", ParagraphStyle("p1", fontName="Helvetica-Bold", fontSize=9.5, textColor=WHITE)), Paragraph("BELØB", ParagraphStyle("p1", fontName="Helvetica-Bold", fontSize=9.5, textColor=WHITE))],
+        ["Timeløn", f"{money(hourly_rate)} kr."],
+        ["Forventet bruttoløn", f"{money(data['expected_gross'])} kr."],
+        ["Faktisk bruttoløn", f"{money(data['gross_salary'])} kr."],
+        ["Afvigelse bruttoløn", f"{money(data['gross_diff'])} kr."],
+        ["SH / Opsparing", f"{money(data['sh_amount'])} kr."],
+        ["Andre fradrag", f"{money(data['other_deductions'])} kr."],
+    ]
+    lon_tbl = Table(lon_data, colWidths=[110 * mm, 73 * mm])
+    lon_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), PRIMARY_MID),
+        ("TEXTCOLOR", (0, 0), (-1, 0), WHITE),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, LIGHT_BG]),
+        ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#dde2ec")),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4 * mm),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4 * mm),
+        ("TOPPADDING", (0, 0), (-1, -1), 2.5 * mm),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5 * mm),
+        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+        ("TEXTCOLOR", (0, 1), (-1, -1), TEXT),
+        ("FONTNAME", (1, 5), (1, 5), "Helvetica-Bold"),
+        ("TEXTCOLOR", (1, 5), (1, 5), RED),
+    ]))
+    story.append(lon_tbl)
+    story.append(Spacer(1, 5 * mm))
 
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 8, "Resumé til HR", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.multi_cell(0, 6, data["summary"])
+    story.append(Paragraph("FORKLARING", styles["headx"]))
+    story.append(HRFlowable(width="100%", thickness=1, color=ACCENT, spaceAfter=3 * mm))
+    rules = [
+        ("Medregnet:", "Arbejdstimer og sygetimer fra Minuba."),
+        ("Ikke medregnet:", "Ferietimer, da ferie er selvbetalt."),
+        ("Sygedage omregnet:", "Fredage tæller 7,0 timer. Øvrige dage tæller 7,5 timer."),
+        ("Regel:", "Lønseddel total > Minuba total = du skylder. Minuba total > lønseddel total = de skylder dig."),
+    ]
+    rule_rows = [[Paragraph(k, ParagraphStyle("rk", fontName="Helvetica-Bold", fontSize=9, textColor=ACCENT)), Paragraph(v, styles["bodyx"])] for k, v in rules]
+    rule_tbl = Table(rule_rows, colWidths=[38 * mm, 145 * mm])
+    rule_tbl.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 1.5 * mm),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5 * mm),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    story.append(rule_tbl)
+    story.append(Spacer(1, 5 * mm))
 
-    pdf.ln(2)
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 8, "Konklusion", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.multi_cell(0, 6, data["conclusion"])
+    story.append(Paragraph("KONKLUSION", styles["headx"]))
+    story.append(HRFlowable(width="100%", thickness=1, color=ACCENT, spaceAfter=3 * mm))
+    story.append(Paragraph(data["conclusion"], styles["bodyx"]))
+    story.append(Spacer(1, 4 * mm))
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pdf.output(str(path))
+    footer = Table([
+        [Paragraph("Rapporten er genereret automatisk af Løncheck — github.com/BenkaDk/Loen-Check", styles["smallx"]), Paragraph(datetime.today().strftime("%d/%m/%Y"), styles["smallx"])],
+    ], colWidths=[155 * mm, 28 * mm])
+    footer.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), LIGHT_BG),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4 * mm),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4 * mm),
+        ("TOPPADDING", (0, 0), (-1, -1), 2.5 * mm),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5 * mm),
+        ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+    ]))
+    story.append(footer)
+
+    doc.build(story)
 
 
 def main():
@@ -277,6 +364,10 @@ def main():
     minuba = load_minuba_csv(Path(args.minuba_csv))
     payslip = load_payslip_csv(Path(args.payslip_csv))
     data = reconcile(minuba, payslip, args.hourly_rate)
+
+    Path(args.out_csv).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out_pdf).parent.mkdir(parents=True, exist_ok=True)
 
     write_csv(data, Path(args.out_csv))
     write_json(data, Path(args.out_json))
