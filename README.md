@@ -136,7 +136,7 @@ period,paid_hours,gross_salary,net_salary,pension_employee,pension_employer,vaca
 
 ## Roadmap
 
-- [ ] PDF-rapport
+- [x] PDF-rapport
 - [ ] GUI
 - [ ] bedre matching af lønseddel-felter
 - [ ] kontrakt-upload til timeløn og pension

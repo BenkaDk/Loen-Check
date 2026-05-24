@@ -39,12 +39,20 @@ PATTERNS = {
         r"Netto[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
     ],
     "sh_period": [
-        r"Søgnehelligdag,\s*opsparet\s+[\d\s\.,]+\s+[\d\s\.,]+\s+([\d\s\.,-]+)",
-        r"Søgnehelligdag\s+[\d\s\.,]+\s+[\d\s\.,]+\s+([\d\s\.,-]+)",
+        r"Søgnehelligdag,\s*opsparet\s+[\d\s\.,%]+\s+[\d\s\.,%]+\s+([\d\s\.,-]+)",
+        r"Søgnehelligdag\s+[\d\s\.,%]+\s+[\d\s\.,%]+\s+([\d\s\.,-]+)",
         r"Søgnehelligdagsopsparing.*?([\d\s\.,-]+)",
         r"Søgnehelligdagsbetaling.*?([\d\s\.,-]+)",
         r"SH\s*[:\-]?\s*([\d\s\.,-]+)",
         r"S/H\s*[:\-]?\s*([\d\s\.,-]+)",
+    ],
+    "sh_rest": [
+        r"Søgnehelligdag(?:, opsparet)?[\s\d\.,%]+\s+[\d\s\.,%]+\s+(-?[\d\s\.,]+)",
+        r"Søgnehelligdag(?:, opsparet)?[\s\d\.,%]+\s+(-?[\d\s\.,]+)\s*$",
+    ],
+    "tax": [
+        r"A-skat[^\n]*?([\-\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2}))\s*$",
+        r"Skat[^\n]*?([\-\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2}))\s*$",
     ],
     "pension_employee": [
         r"Medarbejderbidrag[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
@@ -58,6 +66,29 @@ PATTERNS = {
         r"Arbejdsgiverpension[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
         r"Pension arbejdsgiver[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
         r"Pension overføres(?: til [^\d\n]*)?([\-\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)(?:\s|$)",
+    ],
+    "other_deductions": [
+        r"Fri telefon m\.m\. udligning[\s:]*(-?[\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+        r"ATP-bidrag[^\n]*?(-?[\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+    ],
+}
+
+PATTERNS_YTD = {
+    "a_indkomst_ytd": [
+        r"(?-i:A-Indkomst[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?))",
+    ],
+    "am_grundlag_ytd": [
+        r"(?-i:AM-grundlag[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?))",
+    ],
+    "skattebelob_ytd": [
+        r"(?-i:A-skat, samlet[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?))",
+        r"(?-i:A-skat samlet[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?))",
+    ],
+    "pension_employee_ytd": [
+        r"Arbejdsmarkedspension, medarbejderbidrag[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
+    ],
+    "pension_employer_ytd": [
+        r"Arbejdsmarkedspension, virksomhedsbidrag[\s:]*([\d]{1,3}(?:[.\s]\d{3})*(?:[,.]\d{2})?)",
     ],
 }
 
@@ -85,6 +116,21 @@ def extract_first(patterns: List[str], text: str) -> Optional[float]:
     return None
 
 
+def extract_all(patterns: List[str], text: str) -> List[float]:
+    values = []
+    for pattern in patterns:
+        for m in re.finditer(pattern, text, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL):
+            value = norm_number(m.group(1))
+            if value is not None:
+                values.append(value)
+    return values
+
+
+def extract_last(patterns: List[str], text: str) -> Optional[float]:
+    values = extract_all(patterns, text)
+    return values[-1] if values else None
+
+
 def read_pdf_text(pdf_path: Path) -> str:
     parts = []
     with pdfplumber.open(str(pdf_path)) as pdf:
@@ -97,15 +143,32 @@ def read_pdf_text(pdf_path: Path) -> str:
 
 def parse_payslip_text(text: str) -> dict:
     sh_period = extract_first(PATTERNS["sh_period"], text)
+    sh_rest = extract_last(PATTERNS["sh_rest"], text)
+    pension_employee = extract_first(PATTERNS["pension_employee"], text)
+    pension_employer = extract_first(PATTERNS["pension_employer"], text)
+    pension_employee_ytd = extract_last(PATTERNS_YTD["pension_employee_ytd"], text)
+    pension_employer_ytd = extract_last(PATTERNS_YTD["pension_employer_ytd"], text)
+    pension_total_ytd = None
+    if pension_employee_ytd is not None and pension_employer_ytd is not None:
+        pension_total_ytd = pension_employee_ytd + pension_employer_ytd
     return {
         "arbejdstimer": extract_first(PATTERNS["arbejdstimer"], text),
         "sygdom_days": extract_first(PATTERNS["sygdom_days"], text),
         "ferie_days": extract_first(PATTERNS["ferie_days"], text),
         "brutto": extract_first(PATTERNS["brutto"], text),
         "netto": extract_first(PATTERNS["netto"], text),
+        "skattebelob": extract_first(PATTERNS["tax"], text),
         "sh_period": sh_period,
-        "pension_employee": extract_first(PATTERNS["pension_employee"], text),
-        "pension_employer": extract_first(PATTERNS["pension_employer"], text),
+        "sh_rest": sh_rest,
+        "pension_employee": pension_employee,
+        "pension_employer": pension_employer,
+        "other_deductions": extract_first(PATTERNS["other_deductions"], text),
+        "a_indkomst_ytd": extract_last(PATTERNS_YTD["a_indkomst_ytd"], text),
+        "am_grundlag_ytd": extract_last(PATTERNS_YTD["am_grundlag_ytd"], text),
+        "skattebelob_ytd": extract_last(PATTERNS_YTD["skattebelob_ytd"], text),
+        "pension_employee_ytd": pension_employee_ytd,
+        "pension_employer_ytd": pension_employer_ytd,
+        "pension_total_ytd": pension_total_ytd,
     }
 
 
@@ -120,8 +183,47 @@ def analyze_payslip(pdf_path: Path, debug: bool = False) -> Dict[str, object]:
     return data
 
 
+MONTH_ORDER = {
+    "januar": 1,
+    "februar": 2,
+    "marts": 3,
+    "april": 4,
+    "maj": 5,
+    "juni": 6,
+    "juli": 7,
+    "august": 8,
+    "september": 9,
+    "oktober": 10,
+    "november": 11,
+    "december": 12,
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+
+def month_sort_key(name: str) -> int:
+    text = name.lower()
+    for month, index in MONTH_ORDER.items():
+        if month in text:
+            return index
+    return 999
+
+
 def find_pdfs(folder: Path) -> List[Path]:
-    return sorted([p for p in folder.rglob("*.pdf") if p.is_file()])
+    return sorted(
+        [p for p in folder.rglob("*.pdf") if p.is_file()],
+        key=lambda p: month_sort_key(p.name),
+    )
 
 
 def write_csv(rows: List[Dict[str, object]], output_path: Path) -> None:
@@ -138,11 +240,13 @@ def print_table(rows: List[Dict[str, object]]) -> None:
     if not rows:
         print("Ingen lønsedler fundet.")
         return
-    headers = ["Fil", "Arbejdstimer", "Sygdom (dage)", "Ferie (dage)", "Brutto", "Netto", "SH-perioden", "Pension m.", "Pension arb."]
+    headers = ["Fil", "Arbejdstimer", "Sygdom (dage)", "Ferie (dage)", "Brutto", "Netto", "Skat", "SH-perioden", "SH-rest", "Pension m.", "Pension arb.", "Andre fradrag"]
     print("\n" + " | ".join(headers))
-    print("-" * 145)
+    print("-" * 165)
     for r in rows:
-        print(f"{r['file']} | {r['arbejdstimer']} | {r['sygdom_days']} | {r['ferie_days']} | {r['brutto']} | {r['netto']} | {r.get('sh_period')} | {r['pension_employee']} | {r['pension_employer']}")
+        print(
+            f"{r['file']} | {r['arbejdstimer']} | {r['sygdom_days']} | {r['ferie_days']} | {r['brutto']} | {r['netto']} | {r.get('skattebelob')} | {r.get('sh_period')} | {r.get('sh_rest')} | {r['pension_employee']} | {r['pension_employer']} | {r.get('other_deductions')}"
+        )
 
 
 def main():
@@ -173,6 +277,7 @@ def main():
                 "ferie_days": None,
                 "brutto": None,
                 "netto": None,
+                "skattebelob": None,
                 "sh_period": None,
                 "pension_employee": None,
                 "pension_employer": None,

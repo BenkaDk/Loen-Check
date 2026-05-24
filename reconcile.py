@@ -78,6 +78,41 @@ def detect_category(row) -> str:
         return "vacation"
     return "work"
 
+MONTH_ORDER = {
+    "januar": 1,
+    "februar": 2,
+    "marts": 3,
+    "april": 4,
+    "maj": 5,
+    "juni": 6,
+    "juli": 7,
+    "august": 8,
+    "september": 9,
+    "oktober": 10,
+    "november": 11,
+    "december": 12,
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+
+def month_sort_key(name: str) -> int:
+    text = (name or "").lower()
+    for month, index in MONTH_ORDER.items():
+        if month in text:
+            return index
+    return 999
+
 
 def load_minuba_csv(path: Path) -> Dict[str, float]:
     total = {"work_hours": 0.0, "sick_hours": 0.0, "vacation_hours": 0.0}
@@ -101,12 +136,19 @@ def load_payslip_csv(path: Path) -> Dict[str, Any]:
         "sick_hours": 0.0,
         "gross_salary": 0.0,
         "net_salary": 0.0,
+        "tax": 0.0,
         "sh_period": 0.0,
         "sh_rest": 0.0,
         "pension_employee": 0.0,
         "pension_employer": 0.0,
         "pension_total": 0.0,
         "other_deductions": 0.0,
+        "a_indkomst_ytd": 0.0,
+        "am_grundlag_ytd": 0.0,
+        "skattebelob_ytd": 0.0,
+        "pension_employee_ytd": 0.0,
+        "pension_employer_ytd": 0.0,
+        "pension_total_ytd": 0.0,
         "rows": [],
     }
     with path.open("r", encoding="utf-8-sig", newline="") as f:
@@ -125,18 +167,30 @@ def load_payslip_csv(path: Path) -> Dict[str, Any]:
             sh_rest = normalize_decimal(row.get("sh_rest") or row.get("sh_balance") or row.get("rest") or 0) or 0.0
             emp = normalize_decimal(row.get("pension_employee") or row.get("medarbejderpension") or 0) or 0.0
             er = normalize_decimal(row.get("pension_employer") or row.get("arbejdsgiverpension") or 0) or 0.0
+            tax = normalize_decimal(row.get("skattebelob") or row.get("tax") or row.get("skat") or 0) or 0.0
             ptotal = normalize_decimal(row.get("pension_total") or 0) or 0.0
             if ptotal == 0.0:
                 ptotal = emp + er
             other = normalize_decimal(row.get("andre_fradrag") or row.get("other_deductions") or 0) or 0.0
             result["gross_salary"] += gross
             result["net_salary"] += net
+            result["tax"] += tax
             result["sh_period"] += sh
-            result["sh_rest"] += sh_rest
+            result["sh_rest"] = sh_rest
             result["pension_employee"] += emp
             result["pension_employer"] += er
             result["pension_total"] += ptotal
             result["other_deductions"] += other
+
+    if result["rows"]:
+        result["rows"].sort(key=lambda r: month_sort_key(r.get("file") or ""))
+        last_row = result["rows"][-1]
+        result["a_indkomst_ytd"] = normalize_decimal(last_row.get("a_indkomst_ytd") or last_row.get("brutto_ytd") or 0) or 0.0
+        result["am_grundlag_ytd"] = normalize_decimal(last_row.get("am_grundlag_ytd") or 0) or 0.0
+        result["skattebelob_ytd"] = normalize_decimal(last_row.get("skattebelob_ytd") or 0) or 0.0
+        result["pension_employee_ytd"] = normalize_decimal(last_row.get("pension_employee_ytd") or 0) or 0.0
+        result["pension_employer_ytd"] = normalize_decimal(last_row.get("pension_employer_ytd") or 0) or 0.0
+        result["pension_total_ytd"] = normalize_decimal(last_row.get("pension_total_ytd") or 0) or 0.0
     return result
 
 
@@ -178,6 +232,7 @@ def reconcile(minuba: Dict[str, float], payslip: Dict[str, Any], hourly_rate: fl
         f"Lønsedlens sygetimer beregnet fra dage: {payslip['sick_hours']:.2f}. "
         f"SH i perioden: {payslip['sh_period']:.2f}. "
         f"SH rest: {payslip['sh_rest']:.2f}. "
+        f"Skat: {payslip['tax']:.2f}. "
         f"Medarbejderpension: {payslip['pension_employee']:.2f}. "
         f"Arbejdsgiverpension: {payslip['pension_employer']:.2f}. "
         f"Pension i alt: {payslip['pension_total']:.2f}."
@@ -199,11 +254,18 @@ def reconcile(minuba: Dict[str, float], payslip: Dict[str, Any], hourly_rate: fl
         "gross_salary": round(payslip["gross_salary"], 2),
         "gross_diff": gross_diff,
         "net_salary": round(payslip["net_salary"], 2),
+        "tax": round(payslip["tax"], 2),
+        "a_indkomst_ytd": round(payslip["a_indkomst_ytd"], 2),
+        "am_grundlag_ytd": round(payslip["am_grundlag_ytd"], 2),
+        "skattebelob_ytd": round(payslip["skattebelob_ytd"], 2),
         "sh_period": round(payslip["sh_period"], 2),
         "sh_rest": round(payslip["sh_rest"], 2),
         "pension_employee": round(payslip["pension_employee"], 2),
         "pension_employer": round(payslip["pension_employer"], 2),
         "pension_total": round(payslip["pension_total"], 2),
+        "pension_employee_ytd": round(payslip["pension_employee_ytd"], 2),
+        "pension_employer_ytd": round(payslip["pension_employer_ytd"], 2),
+        "pension_total_ytd": round(payslip["pension_total_ytd"], 2),
         "other_deductions": round(payslip["other_deductions"], 2),
         "summary": summary,
         "conclusion": conclusion,
@@ -311,13 +373,20 @@ def make_pdf(data: Dict[str, Any], path: Path, hourly_rate: float):
         ["Forventet bruttoløn ud fra Minuba", f"{money(data['expected_gross_minuba'])} kr."],
         ["Forventet bruttoløn ud fra lønseddel", f"{money(data['expected_gross_payslip'])} kr."],
         ["Lønseddel brutto", f"{money(data['gross_salary'])} kr."],
+        ["Lønseddel A-indkomst år til dato", f"{money(data['a_indkomst_ytd'])} kr."],
+        ["Lønseddel AM-grundlag år til dato", f"{money(data['am_grundlag_ytd'])} kr."],
         ["Lønseddel netto", f"{money(data['net_salary'])} kr."],
+        ["Skat", f"{money(abs(data['tax']))} kr."],
+        ["A-skat samlet år til dato", f"{money(abs(data['skattebelob_ytd']))} kr."],
         ["SH / Opsparing i perioden", f"{money(data['sh_period'])} kr."],
         ["SH rest", f"{money(data['sh_rest'])} kr."],
         ["Medarbejderpension", f"{money(data['pension_employee'])} kr."],
         ["Arbejdsgiverpension", f"{money(data['pension_employer'])} kr."],
         ["Pension i alt", f"{money(data['pension_total'])} kr."],
-        ["Andre fradrag", f"{money(data['other_deductions'])} kr."],
+        ["Medarbejderpension år til dato", f"{money(data['pension_employee_ytd'])} kr."],
+        ["Arbejdsgiverpension år til dato", f"{money(data['pension_employer_ytd'])} kr."],
+        ["Pension i alt år til dato", f"{money(data['pension_total_ytd'])} kr."],
+        ["Andre fradrag i alt", f"{money(data['other_deductions'])} kr."],
     ]
     lon_tbl = Table(lon_data, colWidths=[110 * mm, 73 * mm])
     lon_tbl.setStyle(TableStyle([
@@ -348,7 +417,8 @@ def make_pdf(data: Dict[str, Any], path: Path, hourly_rate: float):
         ("Sygedage omregnet:", "Fredage tæller 7,0 timer. Øvrige dage tæller 7,5 timer."),
         ("Hovedregel:", "Lønseddel total > Minuba total = du skylder. Minuba total > lønseddel total = de skylder dig."),
         ("SH / Opsparing:", "Vises som info i rapporten."),
-        ("SH rest:", "Viser restsaldo, hvis den findes i DataLøn.")
+        ("SH rest:", "Viser restsaldo, hvis den findes i sidste lønseddel."),
+        ("Andre fradrag:", "Viser den samlede års-sum af fradrag fra lønsedlen.")
     ]
     rule_rows = [[Paragraph(k, ParagraphStyle("rk", fontName="Helvetica-Bold", fontSize=9, textColor=ACCENT)), Paragraph(v, styles["bodyx"])] for k, v in rules]
     rule_tbl = Table(rule_rows, colWidths=[38 * mm, 145 * mm])
