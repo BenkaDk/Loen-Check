@@ -1,5 +1,7 @@
 # Løncheck
 
+![Løncheck banner](./banner.png)
+
 Et Python-værktøj til at sammenligne registrerede timer fra Minuba med data fra lønsedler, så du kan tjekke om din løn passer.
 
 ## Formål
