@@ -1,6 +1,1 @@
-selenium
-pdfplumber
-fpdf2
-rich
-tk
-reportlab
+pip install streamlit selenium webdriver-manager pandas weasyprint openpyxl reportlab pdfplumber
