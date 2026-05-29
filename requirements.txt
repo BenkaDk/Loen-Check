@@ -1,1 +1,10 @@
-pip install streamlit selenium webdriver-manager pandas weasyprint openpyxl reportlab pdfplumber
+selenium
+webdriver-manager
+pdfplumber
+fpdf2
+rich
+reportlab
+streamlit
+pandas
+weasyprint
+openpyxl

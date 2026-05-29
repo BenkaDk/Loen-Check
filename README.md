@@ -16,17 +16,19 @@ Projektet bruges til at:
 
 ## Funktioner
 
-- Scraper timer fra Minuba
+- Streamlit GUI med tre trin (hent, upload, sammenlign)
+- Scraper timer fra Minuba via Selenium
 - Læser lønsedler automatisk fra PDF
 - Matcher data pr. måned
 - Beregner forventet løn ud fra timeløn
-- Marker fejl og afvigelser
+- Markerer fejl og afvigelser
 - Eksporterer resultater til CSV, JSON og PDF
 
 ## Projektstruktur
 
 ```text
-Loenchecker/
+Loen-Check/
+├── app.py
 ├── minuba_timer.py
 ├── lonseddel_analyse.py
 ├── reconcile.py
@@ -67,16 +69,43 @@ pip install -r requirements.txt
 
 ```powershell
 python -m venv .venv
-.\\.venv\\Scripts\\Activate.ps1
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
 ## Brug
 
+### GUI (anbefalet)
+
+Start Streamlit-appen og følg de tre trin i browseren:
+
+```bash
+streamlit run app.py
+```
+
+Åbn derefter `http://localhost:8501` i din browser.
+
+---
+
+Eller kør scripts manuelt via terminalen:
+
 ### 1. Hent data fra Minuba
 
 ```bash
-python minuba_timer.py --periode 2025 --csv data/minuba_2025.csv
+# Helt år
+python minuba_timer.py --email din@email.dk --adgangskode DinKode --periode 2025
+
+# Enkelt måned
+python minuba_timer.py --email din@email.dk --adgangskode DinKode --periode 2025-04
+
+# Kvartal
+python minuba_timer.py --email din@email.dk --adgangskode DinKode --periode 2025-Q1
+
+# Fri dato-periode
+python minuba_timer.py --email din@email.dk --adgangskode DinKode --fra 2025-01-01 --til 2025-03-31
+
+# Med PDF-rapport
+python minuba_timer.py --email din@email.dk --adgangskode DinKode --periode 2025-04 --pdf april.pdf --csv data/minuba_2025.csv
 ```
 
 ### 2. Læs lønsedler
@@ -96,8 +125,6 @@ python reconcile.py \
   --out-json output/reconciliation_report.json \
   --out-pdf output/reconciliation_report.pdf
 ```
-
-
 
 ## Hvad scriptet sammenligner
 
