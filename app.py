@@ -19,7 +19,8 @@ from reconcile import load_minuba_csv, load_payslip_csv, reconcile, make_pdf
 
 st.set_page_config(page_title="Løncheck", page_icon="💰", layout="wide")
 st.title("💰 Løncheck")
-
+st.caption("Dette værktøj er kun en indikation og ikke en erstatning for officiel lønkontrol. Der kan forekomme fejl i data og fortolkning, og systemet opdateres løbende for at blive bedre.")
+st.caption("Udviklet af Benjamin Kallehave")
 tab1, tab2, tab3 = st.tabs(["1️⃣ Hent Minuba-timer", "2️⃣ Lønsedler", "3️⃣ Sammenlign"])
 
 
@@ -135,6 +136,38 @@ with tab1:
                     mime="text/csv",
                 )
 
+    st.divider()
+    st.caption("Eller upload en eksisterende Minuba CSV direkte:")
+    uploaded_minuba_csv = st.file_uploader(
+        "Upload Minuba CSV",
+        type="csv",
+        key="minuba_csv_upload",
+    )
+    if uploaded_minuba_csv:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as f:
+            f.write(uploaded_minuba_csv.read())
+            st.session_state["minuba_csv_path"] = f.name
+
+        try:
+            minuba_data = load_minuba_csv(Path(st.session_state["minuba_csv_path"]))
+            st.success("✅ Minuba CSV uploadet!")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Arbejdstimer", f"{minuba_data['work_hours']:.2f} t")
+            c2.metric("Sygetimer", f"{minuba_data['sick_hours']:.2f} t")
+            c3.metric("Ferietimer", f"{minuba_data['vacation_hours']:.2f} t")
+            c4.metric(
+                "Total (arbejde + syg)",
+                f"{minuba_data['work_hours'] + minuba_data['sick_hours']:.2f} t",
+            )
+            st.download_button(
+                "💾 Download Minuba CSV",
+                data=Path(st.session_state["minuba_csv_path"]).read_bytes(),
+                file_name="minuba_timer.csv",
+                mime="text/csv",
+            )
+        except Exception as e:
+            st.error(f"Kunne ikke læse Minuba CSV: {e}")
+
 
 # ─────────────────────────────────────────────────────────────────
 # TAB 2 — Lønsedler (upload PDF'er → samlet CSV)
@@ -204,12 +237,15 @@ with tab2:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as f:
             f.write(manual_csv.read())
             st.session_state["payslip_csv_path"] = f.name
-        payslip_data = load_payslip_csv(Path(st.session_state["payslip_csv_path"]))
-        st.success("✅ CSV uploadet!")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Arbejdstimer", f"{payslip_data['work_hours']:.2f} t")
-        c2.metric("Bruttoløn", f"{payslip_data['gross_salary']:,.2f} kr.")
-        c3.metric("Nettoløn", f"{payslip_data['net_salary']:,.2f} kr.")
+        try:
+            payslip_data = load_payslip_csv(Path(st.session_state["payslip_csv_path"]))
+            st.success("✅ CSV uploadet!")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Arbejdstimer", f"{payslip_data['work_hours']:.2f} t")
+            c2.metric("Bruttoløn", f"{payslip_data['gross_salary']:,.2f} kr.")
+            c3.metric("Nettoløn", f"{payslip_data['net_salary']:,.2f} kr.")
+        except Exception as e:
+            st.error(f"Kunne ikke læse lønseddel CSV: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -217,6 +253,10 @@ with tab2:
 # ─────────────────────────────────────────────────────────────────
 with tab3:
     st.header("Sammenlign Minuba vs. lønseddel")
+    st.info(
+        "Dette værktøj er tænkt som en vejledende sammenligning, ikke en fast lønkontrol. "
+        "Tjek altid dine originale lønsedler og Minuba-data manuelt, og sig endelig til hvis du finder fejl."
+    )
 
     minuba_ready = "minuba_csv_path" in st.session_state
     payslip_ready = "payslip_csv_path" in st.session_state
@@ -236,14 +276,18 @@ with tab3:
             data = reconcile(minuba, payslip, hourly_rate)
 
             if data["hour_diff"] > 0:
-                color = "green"
+                st.success(data["status"])
             elif data["hour_diff"] < 0:
-                color = "red"
+                st.error(data["status"])
             else:
-                color = "blue"
+                st.info(data["status"])
 
-            st.markdown(f"## :{color}[{data['status']}]")
-            st.info(data["conclusion"])
+            st.markdown(f"**Konklusion:** {data['conclusion']}")
+            st.info("Minuba total er altid arbejde + syge. Ferietimer tæller ikke med i denne sammenligning.")
+            if data['payslip_total_hours_ytd'] > 0:
+                st.info(f"Lønsedlens år-til-dato timer: {data['payslip_total_hours_ytd']:.2f} t. Total beregnes stadig som arbejde + syge.")
+            else:
+                st.info("Lønsedlens samlede timer er beregnet som arbejde + syge fra de uploadede poster.")
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Forskel (timer)", f"{data['hour_diff']:.2f} t")
@@ -258,12 +302,14 @@ with tab3:
                 st.metric("Arbejdstimer", f"{data['minuba_work_hours']:.2f} t")
                 st.metric("Sygetimer", f"{data['minuba_sick_hours']:.2f} t")
                 st.metric("Ferietimer", f"{data['minuba_vacation_hours']:.2f} t")
-                st.metric("Total betalte timer", f"{data['minuba_total_hours']:.2f} t")
+                st.metric("Total betalte timer (arbejde+syg)", f"{data['minuba_total_hours']:.2f} t")
             with c2:
                 st.subheader("Lønseddel")
                 st.metric("Arbejdstimer", f"{data['payslip_work_hours']:.2f} t")
-                st.metric("Sygetimer", f"{data['payslip_sick_hours']:.2f} t")
-                st.metric("Total betalte timer", f"{data['payslip_total_hours']:.2f} t")
+                st.metric("Sygdage", f"{data.get('payslip_sick_days', 0.0):.2f}")
+                st.metric("Total betalte timer (arbejdstimer)", f"{data['payslip_total_hours']:.2f} t")
+                if data['payslip_total_hours_ytd'] > 0:
+                    st.metric("År-til-dato timer", f"{data['payslip_total_hours_ytd']:.2f} t")
 
             st.divider()
             st.subheader("Økonomi detaljer")

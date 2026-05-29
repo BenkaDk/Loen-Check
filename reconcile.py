@@ -89,17 +89,29 @@ def detect_category(row) -> str:
 
 MONTH_ORDER = {
     "januar": 1,
+    "jan": 1,
     "februar": 2,
+    "febuar": 2,
+    "feb": 2,
     "marts": 3,
+    "mar": 3,
     "april": 4,
+    "apr": 4,
     "maj": 5,
     "juni": 6,
+    "jun": 6,
     "juli": 7,
+    "jul": 7,
     "august": 8,
+    "aug": 8,
     "september": 9,
+    "sep": 9,
     "oktober": 10,
+    "okt": 10,
     "november": 11,
+    "nov": 11,
     "december": 12,
+    "dec": 12,
     "january": 1,
     "february": 2,
     "march": 3,
@@ -143,6 +155,7 @@ def load_payslip_csv(path: Path) -> Dict[str, Any]:
     result = {
         "work_hours": 0.0,
         "sick_hours": 0.0,
+        "sick_days": 0.0,
         "gross_salary": 0.0,
         "net_salary": 0.0,
         "tax": 0.0,
@@ -163,6 +176,7 @@ def load_payslip_csv(path: Path) -> Dict[str, Any]:
         "pension_total_ytd": 0.0,
         "rows": [],
     }
+    ytd_hours = []
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -170,9 +184,12 @@ def load_payslip_csv(path: Path) -> Dict[str, Any]:
             work = normalize_decimal(row.get("arbejdstimer") or row.get("hours") or row.get("timer") or 0) or 0.0
             result["work_hours"] += work
             sick_days = normalize_decimal(row.get("sygdom_days") or row.get("sygedage") or row.get("sick_days") or 0) or 0.0
-            sick_date = parse_date(row.get("date") or row.get("dato") or row.get("day") or row.get("Date"))
-            if sick_days:
-                result["sick_hours"] += sick_hours_from_days(sick_days, sick_date)
+            result["sick_days"] += sick_days
+            sick_hours = normalize_decimal(row.get("sygdom_timer") or row.get("sick_hours") or row.get("syg_timer") or 0) or 0.0
+            result["sick_hours"] += sick_hours
+            ytd_value = normalize_decimal(row.get("arbejdstimer_ytd"))
+            if ytd_value is not None:
+                ytd_hours.append(ytd_value)
             gross = normalize_decimal(row.get("brutto") or row.get("gross") or 0) or 0.0
             net = normalize_decimal(row.get("netto") or row.get("net") or 0) or 0.0
             sh = normalize_decimal(row.get("sh_period") or row.get("sh") or row.get("sh_amount") or row.get("savings") or row.get("opsparing") or 0) or 0.0
@@ -205,13 +222,16 @@ def load_payslip_csv(path: Path) -> Dict[str, Any]:
         result["pension_total_ytd"] = normalize_decimal(last_row.get("pension_total_ytd") or 0) or 0.0
         arbejdstimer_ytd = 0.0
         has_ytd_hours = False
-        if last_row.get("arbejdstimer_ytd") not in (None, ""):
-            arbejdstimer_ytd = normalize_decimal(last_row.get("arbejdstimer_ytd")) or 0.0
-            has_ytd_hours = True
+        if ytd_hours:
+            arbejdstimer_ytd = max(ytd_hours)
+            if arbejdstimer_ytd >= result["work_hours"] + result["sick_hours"]:
+                has_ytd_hours = True
+            else:
+                arbejdstimer_ytd = 0.0
         result["arbejdstimer_ytd"] = arbejdstimer_ytd
         result["payslip_total_hours_ytd"] = arbejdstimer_ytd
         result["payslip_total_hours_source"] = "ytd" if has_ytd_hours else "monthly"
-        result["payslip_total_hours"] = arbejdstimer_ytd if has_ytd_hours else result["work_hours"] + result["sick_hours"]
+        result["payslip_total_hours"] = result["work_hours"]
     return result
 
 
@@ -245,9 +265,9 @@ def reconcile(minuba: Dict[str, float], payslip: Dict[str, Any], hourly_rate: fl
         f"Minuba arbejdstimer: {minuba['work_hours']:.2f}. "
         f"Minuba sygetimer: {minuba['sick_hours']:.2f}. "
         f"Ferie-timer er ikke medregnet. "
-        f"Lønsedlens betalte timer: {payslip_total:.2f} ({payslip['payslip_total_hours_source']}). "
+        f"Lønsedlens betalte timer (arbejde+syg): {payslip_total:.2f}. "
         f"Lønsedlens arbejdstimer: {payslip['work_hours']:.2f}. "
-        f"Lønsedlens sygetimer beregnet fra dage: {payslip['sick_hours']:.2f}. "
+        f"Lønsedlens sygedage: {payslip['sick_days']:.2f}. "
         f"SH i perioden: {payslip['sh_period']:.2f}. "
         f"SH rest: {payslip['sh_rest']:.2f}. "
         f"Skat: {payslip['tax']:.2f}. "
@@ -255,6 +275,8 @@ def reconcile(minuba: Dict[str, float], payslip: Dict[str, Any], hourly_rate: fl
         f"Arbejdsgiverpension: {payslip['pension_employer']:.2f}. "
         f"Pension i alt: {payslip['pension_total']:.2f}."
     )
+    if payslip["payslip_total_hours_ytd"]:
+        summary += f" År-til-dato timer: {payslip['payslip_total_hours_ytd']:.2f}."
 
     return {
         "status": status,
@@ -264,6 +286,7 @@ def reconcile(minuba: Dict[str, float], payslip: Dict[str, Any], hourly_rate: fl
         "minuba_total_hours": minuba_total,
         "payslip_work_hours": round(payslip["work_hours"], 2),
         "payslip_sick_hours": round(payslip["sick_hours"], 2),
+        "payslip_sick_days": round(payslip["sick_days"], 2),
         "payslip_total_hours": payslip_total,
         "payslip_total_hours_ytd": round(payslip["payslip_total_hours_ytd"], 2),
         "payslip_total_hours_source": payslip["payslip_total_hours_source"],
